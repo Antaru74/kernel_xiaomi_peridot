@@ -9,7 +9,7 @@ on:
         required: false
       KERNEL_TREE:
         description: 'Kernel Tree'
-        default: 'https://github.com/ahmedtohamy1/kernel_xiaomi_peridot'
+        default: 'https://github.com/Antaru74/kernel_xiaomi_peridot'
         required: true
       KERNEL_TREE_BRANCH:
         description: 'Kernel Tree Branch'
@@ -142,7 +142,7 @@ jobs:
 
         DATE=$(date '+%Y%m%d-%H%M')
         OUT_DIR=out/
-        VERSION="agmad-isis-PERIDOT-${DATE}"
+        VERSION="Antaru-RenKai-PERIDOT-${DATE}"
 
         if [[ -z "${KEBABS}" ]]; then
             COUNT="$(grep -c '^processor' /proc/cpuinfo)"
