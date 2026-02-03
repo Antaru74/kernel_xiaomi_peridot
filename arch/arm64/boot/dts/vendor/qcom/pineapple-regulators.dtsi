@@ -651,9 +651,9 @@
 		S1C: pm_v6c_s1: regulator-pm-v6c-s1 {
 			regulator-name = "pm_v6c_s1";
 			qcom,set = <RPMH_REGULATOR_SET_ALL>;
-			regulator-min-microvolt = <1150000>;
-			regulator-max-microvolt = <1280000>;
-			qcom,init-voltage = <1180000>;
+			regulator-min-microvolt = <1224000>;
+			regulator-max-microvolt = <1348000>;
+			qcom,init-voltage = <1256000>;
 			qcom,init-mode = <RPMH_REGULATOR_MODE_RET>;
 		};
 	};
@@ -678,9 +678,9 @@
 		S3C: pm_v6c_s3: regulator-pm-v6c-s3 {
 			regulator-name = "pm_v6c_s3";
 			qcom,set = <RPMH_REGULATOR_SET_ALL>;
-			regulator-min-microvolt = <800000>;
-			regulator-max-microvolt = <960000>;
-			qcom,init-voltage = <876000>;
+			regulator-min-microvolt = <904000>;
+			regulator-max-microvolt = <1064000>;
+			qcom,init-voltage = <976000>;
 		};
 	};
 
@@ -691,9 +691,9 @@
 		S4C: pm_v6c_s4: regulator-pm-v6c-s4 {
 			regulator-name = "pm_v6c_s4";
 			qcom,set = <RPMH_REGULATOR_SET_ALL>;
-			regulator-min-microvolt = <1100000>;
-			regulator-max-microvolt = <1140000>;
-			qcom,init-voltage = <1110000>;
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1280000>;
+			qcom,init-voltage = <1224000>;
 		};
 	};
 
