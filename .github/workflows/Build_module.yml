@@ -1,0 +1,197 @@
+name: buildisis
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      BUILD_TITLE:
+        description: 'Custom Build Title'
+        required: false
+      KERNEL_TREE:
+        description: 'Kernel Tree'
+        default: 'https://github.com/Antaru74/kernel_xiaomi_peridot'
+        required: true
+      KERNEL_TREE_BRANCH:
+        description: 'Kernel Tree Branch'
+        required: true
+        default: 'stable-r1'
+      CODENAME:
+        description: 'Phone Codename'
+        default: 'peridot'
+        required: true
+      UPLOAD_TO_RELEASE:
+        description: 'Upload to release'
+        type: boolean
+        default: true
+      NOTIFY_START:
+        description: 'Notify Build Start'
+        type: boolean
+        default: true
+      NOTIFY_SUCCESS:
+        description: 'Notify Build Success'
+        type: boolean
+        default: true
+      TELEGRAM_CHAT_ID:
+        description: 'Telegram Chat ID (optional)'
+        required: false
+      KERNELSU_OPTION:
+        description: 'Choose KernelSU setup option (1: next, 2: next-susfs, 3: none)'
+        required: true
+        default: '3'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+
+jobs:
+  build:
+    if: github.event.repository.owner.id == github.event.sender.id
+    runs-on: ubuntu-latest
+    environment: Telegram
+    permissions:
+      contents: write
+
+    steps:
+    - name: Display User Inputs
+      run: |
+        echo "::group::User Inputs"
+        echo "Build Title      : ${{ github.event.inputs.BUILD_TITLE }}"
+        echo "Kernel Tree      : ${{ github.event.inputs.KERNEL_TREE }}"
+        echo "Kernel Branch    : ${{ github.event.inputs.KERNEL_TREE_BRANCH }}"
+        echo "Codename         : ${{ github.event.inputs.CODENAME }}"
+        echo "Upload Release   : ${{ github.event.inputs.UPLOAD_TO_RELEASE }}"
+        echo "KernelSU Option  : ${{ github.event.inputs.KERNELSU_OPTION }}"
+        echo "::endgroup::"
+
+    - name: Notify Build Start
+      if: ${{ github.event.inputs.NOTIFY_START == 'true' }}
+      uses: appleboy/telegram-action@master
+      with:
+        to: ${{ github.event.inputs.TELEGRAM_CHAT_ID || secrets.TELEGRAM_CHAT_ID }}
+        token: ${{ secrets.TELEGRAM_TOKEN }}
+        format: html
+        message: |
+          <b>🚀 Module Build Started</b>
+          <b>📦</b> <code>${{ github.event.inputs.BUILD_TITLE || github.event.inputs.CODENAME }}</code>
+          <b>🌳</b> <code>${{ github.event.inputs.KERNEL_TREE }}</code>
+
+    - name: Generate Build Date
+      id: build_date
+      run: |
+        echo "build_date=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
+
+    - name: Initialize workspace
+      id: workspace
+      run: |
+        mkdir workspace
+        cd workspace
+        echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
+        echo "build_title=${{ github.event.inputs.BUILD_TITLE || github.event.inputs.CODENAME }}" >> $GITHUB_OUTPUT
+
+    - name: Prepare build environment
+      run: |
+        sudo apt update -y
+        sudo apt install -y \
+          git bc bison flex \
+          libssl-dev libncurses-dev \
+          build-essential \
+          ccache \
+          binutils-aarch64-linux-gnu
+
+        mkdir -p $HOME/tc
+        cd $HOME/tc
+        wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz -O clang.tar.gz
+        mkdir clang
+        tar -xf clang.tar.gz -C clang
+
+    - name: Clone kernel source
+      id: kernel
+      working-directory: ${{ steps.workspace.outputs.workspace-folder }}
+      run: |
+        git clone --depth=1 \
+          -b ${{ github.event.inputs.KERNEL_TREE_BRANCH }} \
+          ${{ github.event.inputs.KERNEL_TREE }} kernel_tree
+        echo "kernel-folder=$(pwd)/kernel_tree" >> $GITHUB_OUTPUT
+
+    - name: Build qcom-cpufreq-hw module ONLY
+      id: build
+      working-directory: ${{ steps.kernel.outputs.kernel-folder }}
+      run: |
+        export PATH="$HOME/tc/clang/bin:$PATH"
+        export ARCH=arm64
+        export CC=clang
+        export LD=ld.lld
+        export CLANG_TRIPLE=aarch64-linux-gnu-
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+
+        OUT=out
+        JOBS=$(nproc)
+
+        # KernelSU (optional, aman untuk module)
+        if [[ "${{ github.event.inputs.KERNELSU_OPTION }}" != "3" ]]; then
+          rm -rf KernelSU-Next
+          if [[ "${{ github.event.inputs.KERNELSU_OPTION }}" == "1" ]]; then
+            curl -LSs https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh | bash -s next
+          else
+            curl -LSs https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next-susfs/kernel/setup.sh | bash -s next-susfs
+          fi
+        fi
+
+        echo "---- Defconfig ----"
+        make O=${OUT} -j${JOBS} ${CODENAME}_defconfig
+
+        echo "---- modules_prepare ----"
+        make O=${OUT} -j${JOBS} modules_prepare
+
+        echo "---- Build cpufreq module ----"
+        make O=${OUT} -j${JOBS} M=drivers/cpufreq
+
+        if [ ! -f "${OUT}/drivers/cpufreq/qcom-cpufreq-hw.ko" ]; then
+          echo "❌ Module build failed"
+          exit 1
+        fi
+
+        mkdir -p module_out
+        cp ${OUT}/drivers/cpufreq/qcom-cpufreq-hw.ko module_out/
+
+        ZIP_NAME="qcom-cpufreq-hw-${{ github.event.inputs.CODENAME }}-${{ steps.build_date.outputs.build_date }}"
+        zip -r "${ZIP_NAME}.zip" module_out
+
+        echo "zipname=${ZIP_NAME}.zip" >> $GITHUB_OUTPUT
+
+    - name: Upload Module to Release
+      if: ${{ github.event.inputs.UPLOAD_TO_RELEASE == 'true' }}
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: module-${{ github.event.inputs.CODENAME }}-${{ steps.build_date.outputs.build_date }}
+        name: ${{ steps.workspace.outputs.build_title }}
+        body: |
+          ✅ **Kernel Module Build Success**
+
+          **Module**: `qcom-cpufreq-hw.ko`
+          **Device**: `${{ github.event.inputs.CODENAME }}`
+          **Kernel Tree**: `${{ github.event.inputs.KERNEL_TREE }}`
+          **Branch**: `${{ github.event.inputs.KERNEL_TREE_BRANCH }}`
+
+          Path:
+          ```
+          drivers/cpufreq/qcom-cpufreq-hw.c
+          ```
+        files: |
+          ${{ steps.kernel.outputs.kernel-folder }}/${{ steps.build.outputs.zipname }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Notify Build Success
+      if: ${{ success() && github.event.inputs.NOTIFY_SUCCESS == 'true' }}
+      uses: appleboy/telegram-action@master
+      with:
+        to: ${{ github.event.inputs.TELEGRAM_CHAT_ID || secrets.TELEGRAM_CHAT_ID }}
+        token: ${{ secrets.TELEGRAM_TOKEN }}
+        format: html
+        message: |
+          <b>✅ Module Build Success</b>
+          <b>📄</b> <code>qcom-cpufreq-hw.ko</code>
+          <b>📱</b> <code>${{ github.event.inputs.CODENAME }}</code>
