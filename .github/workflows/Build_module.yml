@@ -23,6 +23,10 @@ on:
         description: 'Module name (without .ko)'
         default: 'qcom-cpufreq-hw'
         required: true
+      UPLOAD_TO_RELEASE:
+        description: 'Upload to release'
+        type: boolean
+        default: false
       NOTIFY_START:
         description: 'Notify Build Start'
         type: boolean
@@ -59,6 +63,7 @@ jobs:
         echo "Kernel Tree: ${{ github.event.inputs.KERNEL_TREE }}/tree/${{ github.event.inputs.KERNEL_TREE_BRANCH }}"
         echo "Codename: ${{ github.event.inputs.CODENAME }}"
         echo "Module Name: ${{ github.event.inputs.MODULE_NAME }}"
+        echo "Upload to Release: ${{ github.event.inputs.UPLOAD_TO_RELEASE }}"
         echo "Notify Build Start: ${{ github.event.inputs.NOTIFY_START }}"
         echo "Notify Build Success: ${{ github.event.inputs.NOTIFY_SUCCESS }}"
         echo "Telegram Chat ID: ${{ github.event.inputs.TELEGRAM_CHAT_ID || secrets.TELEGRAM_CHAT_ID }}"
@@ -79,6 +84,7 @@ jobs:
           <b>📱 Device Codename</b>: <code>${{ github.event.inputs.CODENAME }}</code>
           <b>📦 Module Name</b>: <code>${{ github.event.inputs.MODULE_NAME }}.ko</code>
           <b>🌳 Kernel Tree</b>: <code>${{ github.event.inputs.KERNEL_TREE }}/tree/${{ github.event.inputs.KERNEL_TREE_BRANCH }}</code>
+          <b>📤 Upload to Release</b>: <code>${{ github.event.inputs.UPLOAD_TO_RELEASE }}</code>
           <b>🔧 KernelSU Option</b>: <code>${{ github.event.inputs.KERNELSU_OPTION }}</code>
 
     - name: Generate Build Date
@@ -190,6 +196,7 @@ jobs:
             echo "Built from: ${{ github.event.inputs.KERNEL_TREE }}" >> module_output/README.txt
             echo "Branch: ${{ github.event.inputs.KERNEL_TREE_BRANCH }}" >> module_output/README.txt
             echo "Build date: $DATE" >> module_output/README.txt
+            echo "Codename: ${{ github.event.inputs.CODENAME }}" >> module_output/README.txt
             
             cd module_output
             zip -r9 "../${MODULE_ZIP}" *
@@ -204,6 +211,29 @@ jobs:
         fi
       working-directory: ${{ steps.kernel.outputs.kernel-folder }}
       id: build
+
+    - name: Upload to Release
+      if: ${{ github.event.inputs.UPLOAD_TO_RELEASE == 'true' }}
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          ${{ steps.kernel.outputs.kernel-folder }}/${{ steps.build.outputs.zipname }}
+        name: ${{ github.event.inputs.CODENAME }}-module-${{ steps.build_date.outputs.build_date }}
+        tag_name: ${{ github.event.inputs.CODENAME }}-module-${{ steps.build_date.outputs.build_date }}
+        body: |
+          <b>Kernel Module Build Succeeded</b> ✅
+          <b>${{ steps.workspace.outputs.build_title }}</b>
+          <b>Module successfully built!</b>, took $((DIFF / 60)) minutes and $((DIFF % 60)) seconds.
+          <b>📱 Device Codename</b>: <code>${{ github.event.inputs.CODENAME }}</code>
+          <b>📦 Module Name</b>: <code>${{ github.event.inputs.MODULE_NAME }}.ko</code>
+          <b>🌳 Kernel tree</b>: ${{ github.event.inputs.KERNEL_TREE }}/tree/${{ github.event.inputs.KERNEL_TREE_BRANCH }}
+          <b>🔧 KernelSU Option</b>: ${{ github.event.inputs.KERNELSU_OPTION }}
+          <b>📅 Build Date</b>: $DATE
+          <b>🔗 Action</b>: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          <b>📄 Workflow File</b>: ${{ github.workflow }}.yml
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      id: upload_release
 
     - name: Create GoFile upload script
       run: |
@@ -245,6 +275,7 @@ jobs:
           <b>📱 Device Codename</b>: <code>${{ github.event.inputs.CODENAME }}</code>
           <b>📦 Module Name</b>: <code>${{ github.event.inputs.MODULE_NAME }}.ko</code>
           <b>📄 File</b>: <code>${{ steps.build.outputs.zipname }}</code>
+          ${{ github.event.inputs.UPLOAD_TO_RELEASE == 'true' && format('<b>🚀 Release</b>: <a href="{0}/{1}/releases/tag/{2}-module-{3}">View Release</a>', github.server_url, github.repository, github.event.inputs.CODENAME, steps.build_date.outputs.build_date) || '' }}
           <b>🔗 GoFile Download Link</b>: <a href="${{ env.FILE_URL }}">Download</a>
         files: |
           ${{ steps.kernel.outputs.kernel-folder }}/${{ steps.build.outputs.zipname }}
