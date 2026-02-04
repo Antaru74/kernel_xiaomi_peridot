@@ -1,4 +1,4 @@
-name: buildisis
+name: buildmodule
 
 on:
   pull_request:
@@ -19,10 +19,10 @@ on:
         description: 'Phone Codename'
         default: 'peridot'
         required: true
-      UPLOAD_TO_RELEASE:
-        description: 'Upload to release'
-        type: boolean
-        default: true
+      MODULE_NAME:
+        description: 'Module name (without .ko)'
+        default: 'qcom-cpufreq-hw'
+        required: true
       NOTIFY_START:
         description: 'Notify Build Start'
         type: boolean
@@ -37,7 +37,7 @@ on:
       KERNELSU_OPTION:
         description: 'Choose KernelSU setup option (1: next, 2: next-susfs, 3: none)'
         required: true
-        default: '3'
+        default: '1'
         type: choice
         options:
           - '1'
@@ -51,17 +51,18 @@ jobs:
     environment: Telegram
     permissions:
       contents: write
-
     steps:
     - name: Display User Inputs
       run: |
-        echo "::group::User Inputs"
-        echo "Build Title      : ${{ github.event.inputs.BUILD_TITLE }}"
-        echo "Kernel Tree      : ${{ github.event.inputs.KERNEL_TREE }}"
-        echo "Kernel Branch    : ${{ github.event.inputs.KERNEL_TREE_BRANCH }}"
-        echo "Codename         : ${{ github.event.inputs.CODENAME }}"
-        echo "Upload Release   : ${{ github.event.inputs.UPLOAD_TO_RELEASE }}"
-        echo "KernelSU Option  : ${{ github.event.inputs.KERNELSU_OPTION }}"
+        echo "::group::User Environment Variables"
+        echo "Custom Build Title: ${{ github.event.inputs.BUILD_TITLE }}"
+        echo "Kernel Tree: ${{ github.event.inputs.KERNEL_TREE }}/tree/${{ github.event.inputs.KERNEL_TREE_BRANCH }}"
+        echo "Codename: ${{ github.event.inputs.CODENAME }}"
+        echo "Module Name: ${{ github.event.inputs.MODULE_NAME }}"
+        echo "Notify Build Start: ${{ github.event.inputs.NOTIFY_START }}"
+        echo "Notify Build Success: ${{ github.event.inputs.NOTIFY_SUCCESS }}"
+        echo "Telegram Chat ID: ${{ github.event.inputs.TELEGRAM_CHAT_ID || secrets.TELEGRAM_CHAT_ID }}"
+        echo "KernelSU Option: ${{ github.event.inputs.KERNELSU_OPTION }}"
         echo "::endgroup::"
 
     - name: Notify Build Start
@@ -72,117 +73,163 @@ jobs:
         token: ${{ secrets.TELEGRAM_TOKEN }}
         format: html
         message: |
-          <b>🚀 Module Build Started</b>
-          <b>📦</b> <code>${{ github.event.inputs.BUILD_TITLE || github.event.inputs.CODENAME }}</code>
-          <b>🌳</b> <code>${{ github.event.inputs.KERNEL_TREE }}</code>
+          <b>🚀 Kernel Module Build Started</b>
+          🔧 <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View Workflow Run</a>
+          <b>📦 Build Title</b>: <code>${{ github.event.inputs.BUILD_TITLE || github.event.inputs.CODENAME }}</code>
+          <b>📱 Device Codename</b>: <code>${{ github.event.inputs.CODENAME }}</code>
+          <b>📦 Module Name</b>: <code>${{ github.event.inputs.MODULE_NAME }}.ko</code>
+          <b>🌳 Kernel Tree</b>: <code>${{ github.event.inputs.KERNEL_TREE }}/tree/${{ github.event.inputs.KERNEL_TREE_BRANCH }}</code>
+          <b>🔧 KernelSU Option</b>: <code>${{ github.event.inputs.KERNELSU_OPTION }}</code>
 
     - name: Generate Build Date
       id: build_date
       run: |
-        echo "build_date=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
+        build_date=$(date +"%Y%m%d")  
+        echo "build_date=$build_date" >> $GITHUB_OUTPUT
 
     - name: Initialize workspace
-      id: workspace
       run: |
         mkdir workspace
         cd workspace
         echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
+        echo "start_time=$(date +%s)" >> $GITHUB_OUTPUT
         echo "build_title=${{ github.event.inputs.BUILD_TITLE || github.event.inputs.CODENAME }}" >> $GITHUB_OUTPUT
+      id: workspace
 
-    - name: Prepare build environment
+    - name: Prepare the build environment
       run: |
         sudo apt update -y
-        sudo apt install -y \
-          git bc bison flex \
-          libssl-dev libncurses-dev \
-          build-essential \
-          ccache \
-          binutils-aarch64-linux-gnu
-
+        sudo apt install -y flex bison libncurses-dev libssl-dev bc build-essential git ccache binutils-aarch64-linux-gnu
         mkdir -p $HOME/tc
         cd $HOME/tc
         wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz -O clang.tar.gz
         mkdir clang
         tar -xf clang.tar.gz -C clang
+        echo "tools-folder=$HOME/tc/clang" >> $GITHUB_OUTPUT
+      id: tools
 
     - name: Clone kernel source
-      id: kernel
-      working-directory: ${{ steps.workspace.outputs.workspace-folder }}
       run: |
-        git clone --depth=1 \
-          -b ${{ github.event.inputs.KERNEL_TREE_BRANCH }} \
-          ${{ github.event.inputs.KERNEL_TREE }} kernel_tree
+        git clone --depth=1 ${{ github.event.inputs.KERNEL_TREE }} -b ${{ github.event.inputs.KERNEL_TREE_BRANCH }} kernel_tree
         echo "kernel-folder=$(pwd)/kernel_tree" >> $GITHUB_OUTPUT
+      working-directory: ${{ steps.workspace.outputs.workspace-folder }}
+      id: kernel
 
-    - name: Build qcom-cpufreq-hw module ONLY
-      id: build
-      working-directory: ${{ steps.kernel.outputs.kernel-folder }}
+    - name: Building module
       run: |
-        export PATH="$HOME/tc/clang/bin:$PATH"
-        export ARCH=arm64
-        export CC=clang
-        export LD=ld.lld
-        export CLANG_TRIPLE=aarch64-linux-gnu-
-        export CROSS_COMPILE=aarch64-linux-gnu-
-        export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+        # Remove existing KernelSU-Next directory if it exists
+        rm -rf KernelSU-Next
 
-        OUT=out
-        JOBS=$(nproc)
-
-        # KernelSU (optional, aman untuk module)
-        if [[ "${{ github.event.inputs.KERNELSU_OPTION }}" != "3" ]]; then
-          rm -rf KernelSU-Next
-          if [[ "${{ github.event.inputs.KERNELSU_OPTION }}" == "1" ]]; then
-            curl -LSs https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh | bash -s next
-          else
-            curl -LSs https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next-susfs/kernel/setup.sh | bash -s next-susfs
-          fi
-        fi
-
-        echo "---- Defconfig ----"
-        make O=${OUT} -j${JOBS} ${CODENAME}_defconfig
-
-        echo "---- modules_prepare ----"
-        make O=${OUT} -j${JOBS} modules_prepare
-
-        echo "---- Build cpufreq module ----"
-        make O=${OUT} -j${JOBS} M=drivers/cpufreq
-
-        if [ ! -f "${OUT}/drivers/cpufreq/qcom-cpufreq-hw.ko" ]; then
-          echo "❌ Module build failed"
+        # Choose the KernelSU setup script based on the selected option
+        if [[ "${{ github.event.inputs.KERNELSU_OPTION }}" == '1' ]]; then
+          echo "Using KernelSU Next setup script..."
+          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+        elif [[ "${{ github.event.inputs.KERNELSU_OPTION }}" == '2' ]]; then
+          echo "Using KernelSU Next-SUSFS setup script..."
+          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next-susfs/kernel/setup.sh" | bash -s next-susfs
+        elif [[ "${{ github.event.inputs.KERNELSU_OPTION }}" == '3' ]]; then
+          echo "Skipping KernelSU setup..."
+        else
+          echo "Invalid KernelSU option selected!"
           exit 1
         fi
 
-        mkdir -p module_out
-        cp ${OUT}/drivers/cpufreq/qcom-cpufreq-hw.ko module_out/
+        # Set up build environment
+        export PATH="$HOME/tc/clang/bin:$PATH"
+        export LD_LIBRARY_PATH=${HOME}/tc/clang/lib64:$LD_LIBRARY_PATH
+        export KBUILD_COMPILER_STRING=$($HOME/tc/clang/bin/clang --version | head -n 1 | perl -pe 's/\(http.*?\)//gs' | sed -e 's/  */ /g' -e 's/[[:space:]]*$//')
+        export KBUILD_LINKER_STRING=$($HOME/tc/clang/bin/ld.lld --version | head -n 1 | perl -pe 's/\(http.*?\)//gs' | sed -e 's/  */ /g' -e 's/[[:space:]]*$//' | sed 's/(compatible with [^)]*)//')
 
-        ZIP_NAME="qcom-cpufreq-hw-${{ github.event.inputs.CODENAME }}-${{ steps.build_date.outputs.build_date }}"
-        zip -r "${ZIP_NAME}.zip" module_out
+        DATE=$(date '+%Y%m%d-%H%M')
+        OUT_DIR=out/
+        
+        if [[ -z "${KEBABS}" ]]; then
+            COUNT="$(grep -c '^processor' /proc/cpuinfo)"
+            export KEBABS="$COUNT"
+        fi
 
-        echo "zipname=${ZIP_NAME}.zip" >> $GITHUB_OUTPUT
+        echo "Jobs: ${KEBABS}"
 
-    - name: Upload Module to Release
-      if: ${{ github.event.inputs.UPLOAD_TO_RELEASE == 'true' }}
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: module-${{ github.event.inputs.CODENAME }}-${{ steps.build_date.outputs.build_date }}
-        name: ${{ steps.workspace.outputs.build_title }}
-        body: |
-          ✅ **Kernel Module Build Success**
+        ARGS="ARCH=arm64 \
+        O=${OUT_DIR} \
+        CC=clang \
+        LD=ld.lld \
+        CLANG_TRIPLE=aarch64-linux-gnu- \
+        CROSS_COMPILE=aarch64-linux-gnu- \
+        CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+        -j${KEBABS}"
 
-          **Module**: `qcom-cpufreq-hw.ko`
-          **Device**: `${{ github.event.inputs.CODENAME }}`
-          **Kernel Tree**: `${{ github.event.inputs.KERNEL_TREE }}`
-          **Branch**: `${{ github.event.inputs.KERNEL_TREE_BRANCH }}`
+        START=$(date +"%s")
 
-          Path:
-          ```
-          drivers/cpufreq/qcom-cpufreq-hw.c
-          ```
-        files: |
-          ${{ steps.kernel.outputs.kernel-folder }}/${{ steps.build.outputs.zipname }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        echo "------ Starting Configuration ------"
+
+        # Create .config file
+        make -j${KEBABS} ${ARGS} peridot_defconfig
+        
+        echo "------ Building only qcom-cpufreq-hw module ------"
+        
+        # Build only the specific module
+        make -j${KEBABS} ${ARGS} CC="ccache clang" HOSTCC="ccache gcc" drivers/cpufreq/qcom-cpufreq-hw.ko
+        
+        END=$(date +"%s")
+        DIFF=$((END - START))
+        
+        # Check if module was built successfully
+        MODULE_PATH="${OUT_DIR}/drivers/cpufreq/qcom-cpufreq-hw.ko"
+        if [ -f "$MODULE_PATH" ]; then
+            echo -e "\nModule built successfully in $((DIFF / 60)) minute(s) and $((DIFF % 60)) second(s) !"
+            echo "Module path: $MODULE_PATH"
+            
+            # Create a simple zip with the module
+            MODULE_ZIP="${{ github.event.inputs.MODULE_NAME }}-$DATE.zip"
+            mkdir -p module_output
+            cp "$MODULE_PATH" "module_output/${{ github.event.inputs.MODULE_NAME }}.ko"
+            
+            # Add a simple README
+            echo "Module: ${{ github.event.inputs.MODULE_NAME }}.ko" > module_output/README.txt
+            echo "Built from: ${{ github.event.inputs.KERNEL_TREE }}" >> module_output/README.txt
+            echo "Branch: ${{ github.event.inputs.KERNEL_TREE_BRANCH }}" >> module_output/README.txt
+            echo "Build date: $DATE" >> module_output/README.txt
+            
+            cd module_output
+            zip -r9 "../${MODULE_ZIP}" *
+            cd ..
+            
+            echo "zipname=${MODULE_ZIP}" >> $GITHUB_OUTPUT
+            echo "module_path=${MODULE_PATH}" >> $GITHUB_OUTPUT
+        else
+            echo -e "\nModule compilation failed!"
+            echo "Expected module at: $MODULE_PATH"
+            exit 1
+        fi
+      working-directory: ${{ steps.kernel.outputs.kernel-folder }}
+      id: build
+
+    - name: Create GoFile upload script
+      run: |
+        echo '#!/bin/bash' > upload_gofile.sh
+        echo '' >> upload_gofile.sh
+        echo 'if [[ "$#"  ==  '\''0'\'' ]]; then' >> upload_gofile.sh
+        echo 'echo  -e '\''ERROR: No File Specified!'\'' && exit 1' >> upload_gofile.sh
+        echo 'fi' >> upload_gofile.sh
+        echo 'FILE="@$1"' >> upload_gofile.sh
+        echo 'SERVER=$(curl -s https://api.gofile.io/servers | jq -r '\''.data.servers[0].name'\'')' >> upload_gofile.sh
+        echo 'LINK=$(curl -# -F file=${FILE} https://${SERVER}.gofile.io/uploadFile | jq -r '\''.data|.downloadPage'\'') 2>&1' >> upload_gofile.sh
+        echo 'echo $LINK' >> upload_gofile.sh
+        chmod +x upload_gofile.sh
+
+    - name: Rename Module ZIP for GoFile
+      run: |
+        BUILD_TIME_SUFFIX=$(date +"%Y%m%d%H%M%S")
+        mv ${{ steps.kernel.outputs.kernel-folder }}/${{ steps.build.outputs.zipname }} ${{ steps.kernel.outputs.kernel-folder }}/${{ github.event.inputs.MODULE_NAME }}-${{ steps.build_date.outputs.build_date }}-${BUILD_TIME_SUFFIX}.zip
+        echo "BUILD_TIME_SUFFIX=${BUILD_TIME_SUFFIX}" >> $GITHUB_ENV
+
+    - name: Upload Module ZIP to GoFile
+      id: upload_gofile
+      run: |
+        ./upload_gofile.sh ${{ steps.kernel.outputs.kernel-folder }}/${{ github.event.inputs.MODULE_NAME }}-${{ steps.build_date.outputs.build_date }}-${{ env.BUILD_TIME_SUFFIX }}.zip > gofile_link.txt
+        FILE_URL=$(cat gofile_link.txt)
+        echo "FILE_URL=${FILE_URL}" >> $GITHUB_ENV
 
     - name: Notify Build Success
       if: ${{ success() && github.event.inputs.NOTIFY_SUCCESS == 'true' }}
@@ -192,6 +239,12 @@ jobs:
         token: ${{ secrets.TELEGRAM_TOKEN }}
         format: html
         message: |
-          <b>✅ Module Build Success</b>
-          <b>📄</b> <code>qcom-cpufreq-hw.ko</code>
-          <b>📱</b> <code>${{ github.event.inputs.CODENAME }}</code>
+          <b>Kernel Module Build Succeeded</b> ✅
+          🔧 <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View Workflow Run</a>
+          <b>📦 Build Title</b>: <code>${{ steps.workspace.outputs.build_title }}</code>
+          <b>📱 Device Codename</b>: <code>${{ github.event.inputs.CODENAME }}</code>
+          <b>📦 Module Name</b>: <code>${{ github.event.inputs.MODULE_NAME }}.ko</code>
+          <b>📄 File</b>: <code>${{ steps.build.outputs.zipname }}</code>
+          <b>🔗 GoFile Download Link</b>: <a href="${{ env.FILE_URL }}">Download</a>
+        files: |
+          ${{ steps.kernel.outputs.kernel-folder }}/${{ steps.build.outputs.zipname }}
