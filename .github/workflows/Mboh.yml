@@ -1,0 +1,148 @@
+name: buildisis
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      BUILD_TITLE:
+        description: 'Custom Build Title'
+        required: false
+      KERNEL_TREE:
+        description: 'Kernel Tree'
+        default: 'https://github.com/Antaru74/kernel_xiaomi_peridot'
+        required: true
+      KERNEL_TREE_BRANCH:
+        description: 'Kernel Tree Branch'
+        required: true
+        default: 'stable-r1'
+      CODENAME:
+        description: 'Phone Codename'
+        default: 'peridot'
+        required: true
+      UPLOAD_TO_RELEASE:
+        description: 'Upload to release'
+        type: boolean
+        default: false
+      NOTIFY_START:
+        description: 'Notify Build Start'
+        type: boolean
+        default: true
+      NOTIFY_SUCCESS:
+        description: 'Notify Build Success'
+        type: boolean
+        default: true
+      TELEGRAM_CHAT_ID:
+        description: 'Telegram Chat ID (optional)'
+        required: false
+      KERNELSU_OPTION:
+        description: 'Choose KernelSU setup option (1: next, 2: next-susfs, 3: none)'
+        required: true
+        default: '1'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+
+jobs:
+  build:
+    if: github.event.repository.owner.id == github.event.sender.id
+    runs-on: ubuntu-latest
+    environment: Telegram
+    permissions:
+      contents: write
+
+    steps:
+    - name: Display User Inputs
+      run: |
+        echo "::group::User Environment Variables"
+        echo "Build Title: ${{ github.event.inputs.BUILD_TITLE }}"
+        echo "Kernel Tree: ${{ github.event.inputs.KERNEL_TREE }}"
+        echo "Branch: ${{ github.event.inputs.KERNEL_TREE_BRANCH }}"
+        echo "Codename: ${{ github.event.inputs.CODENAME }}"
+        echo "KernelSU Option: ${{ github.event.inputs.KERNELSU_OPTION }}"
+        echo "::endgroup::"
+
+    - name: Notify Build Start
+      if: ${{ github.event.inputs.NOTIFY_START == 'true' }}
+      uses: appleboy/telegram-action@master
+      with:
+        to: ${{ github.event.inputs.TELEGRAM_CHAT_ID || secrets.TELEGRAM_CHAT_ID }}
+        token: ${{ secrets.TELEGRAM_TOKEN }}
+        format: html
+        message: |
+          <b>🚀 Kernel Partial Build Started</b>
+          <b>Target</b>: qcom-cpufreq-undervolt.o
+          <b>Device</b>: <code>${{ github.event.inputs.CODENAME }}</code>
+
+    - name: Prepare build environment
+      run: |
+        sudo apt update -y
+        sudo apt install -y \
+          flex bison bc build-essential git ccache \
+          libncurses-dev libssl-dev binutils-aarch64-linux-gnu
+
+        mkdir -p $HOME/tc
+        cd $HOME/tc
+        wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz -O clang.tar.gz
+        mkdir clang
+        tar -xf clang.tar.gz -C clang
+
+    - name: Clone kernel source
+      run: |
+        git clone --depth=1 \
+          -b ${{ github.event.inputs.KERNEL_TREE_BRANCH }} \
+          ${{ github.event.inputs.KERNEL_TREE }} kernel_tree
+
+    - name: Build qcom-cpufreq-undervolt.o
+      working-directory: kernel_tree
+      run: |
+        set -e
+
+        echo "===> KernelSU setup"
+        rm -rf KernelSU-Next
+        if [[ "${{ github.event.inputs.KERNELSU_OPTION }}" == "1" ]]; then
+          curl -LSs https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh | bash -s next
+        elif [[ "${{ github.event.inputs.KERNELSU_OPTION }}" == "2" ]]; then
+          curl -LSs https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next-susfs/kernel/setup.sh | bash -s next-susfs
+        fi
+
+        export PATH="$HOME/tc/clang/bin:$PATH"
+        export LD_LIBRARY_PATH="$HOME/tc/clang/lib64:$LD_LIBRARY_PATH"
+
+        OUT_DIR=out
+        JOBS=$(nproc)
+
+        ARGS="ARCH=arm64 \
+        O=${OUT_DIR} \
+        CC=clang \
+        LD=ld.lld \
+        CLANG_TRIPLE=aarch64-linux-gnu- \
+        CROSS_COMPILE=aarch64-linux-gnu- \
+        CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
+
+        echo "===> Defconfig"
+        make ${ARGS} peridot_defconfig
+
+        echo "===> Prepare kernel"
+        make ${ARGS} prepare
+        make ${ARGS} scripts
+
+        echo "===> Build ONLY drivers/cpufreq/qcom-cpufreq-undervolt.o"
+        make ${ARGS} drivers/cpufreq/qcom-cpufreq-undervolt.o -j${JOBS}
+
+        echo "===> Verify output"
+        test -f out/drivers/cpufreq/qcom-cpufreq-undervolt.o
+        ls -lh out/drivers/cpufreq/qcom-cpufreq-undervolt.o
+
+    - name: Notify Build Success
+      if: ${{ success() && github.event.inputs.NOTIFY_SUCCESS == 'true' }}
+      uses: appleboy/telegram-action@master
+      with:
+        to: ${{ github.event.inputs.TELEGRAM_CHAT_ID || secrets.TELEGRAM_CHAT_ID }}
+        token: ${{ secrets.TELEGRAM_TOKEN }}
+        format: html
+        message: |
+          <b>✅ Build Success</b>
+          <b>File</b>: qcom-cpufreq-undervolt.o
+          <b>Path</b>: out/drivers/cpufreq/
