@@ -18,6 +18,12 @@ config CPU_FREQ
 
 	  If in doubt, say N.
 
+config QCOM_CPUFREQ_UNDERVOLT
+	tristate "QCOM CPUFreq Undervolt Support"
+	depends on QCOM_CPUFREQ_HW
+	help
+	  Enable dynamic undervolt sysfs interface for QCOM CPUs
+
 config CPU_FREQ_MSM
 	bool "CPU Frequency scaling"
 	select SRCU
