@@ -1,4 +1,4 @@
-name: buildisis
+name: Mboh
 
 on:
   pull_request:
