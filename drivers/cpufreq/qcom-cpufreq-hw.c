@@ -18,6 +18,7 @@
 #include <linux/spinlock.h>
 #include <linux/qcom-cpufreq-hw.h>
 #include <linux/topology.h>
+#include "qcom-cpufreq-undervolt.h"
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/dcvsh.h>
@@ -126,12 +127,17 @@ static int qcom_cpufreq_set_bw(struct cpufreq_policy *policy,
 	return ret;
 }
 
+// MODIFIKASI fungsi qcom_cpufreq_update_opp (ganti kode lama dengan ini)
 static int qcom_cpufreq_update_opp(struct device *cpu_dev,
 				   unsigned long freq_khz,
 				   unsigned long volt)
 {
 	unsigned long freq_hz = freq_khz * 1000;
+	unsigned int cpu = smp_processor_id();  // ⬅️ TAMBAH INI
 	int ret;
+
+	/* Apply undervolt offset if configured */
+	volt = qcom_apply_undervolt(cpu, volt);  // ⬅️ TAMBAH INI
 
 	/* Skip voltage update if the opp table is not available */
 	if (!icc_scaling_enabled)
