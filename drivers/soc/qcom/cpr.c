@@ -1205,7 +1205,7 @@ static int cpr_corner_init(struct cpr_drv *drv)
 			corner->uV = cpr_interpolate(corner, step_volt, fdata);
 		}
 
-		corner->max_uV = fuse->max_uV;
+		corner->uV -= 15000;
 		corner->min_uV = fuse->min_uV;
 		corner->uV = clamp(corner->uV, corner->min_uV, corner->max_uV);
 		corner->last_uV = corner->uV;
@@ -1215,7 +1215,10 @@ static int cpr_corner_init(struct cpr_drv *drv)
 			corner->max_uV = corner->uV;
 		else if (desc->reduce_to_fuse_uV && fuse->uV < corner->max_uV)
 			corner->max_uV = max(corner->min_uV, fuse->uV);
-
+       
+		corner->max_uV -= 20000;
+        corner->max_uV = max(corner->max_uV, corner->min_uV);
+		
 		dev_dbg(drv->dev, "corner %d: [%d %d %d] quot %d\n", i,
 			corner->min_uV, corner->uV, corner->max_uV,
 			fuse->quot - corner->quot_adjust);
