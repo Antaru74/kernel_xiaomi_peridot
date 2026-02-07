@@ -19,10 +19,11 @@ config CPU_FREQ
 	  If in doubt, say N.
 
 config QCOM_CPUFREQ_UNDERVOLT
-	tristate "QCOM CPUFreq Undervolt Support"
-	depends on QCOM_CPUFREQ_HW
+	bool "QCOM CPUFreq Undervolt Support"
+	depends on ARM_QCOM_CPUFREQ_HW
 	help
-	  Enable dynamic undervolt sysfs interface for QCOM CPUs
+	  Enable dynamic undervolt sysfs interface for Qualcomm CPUs.
+	  Requires qcom-cpufreq-hw driver.
 
 config CPU_FREQ_MSM
 	bool "CPU Frequency scaling"
