@@ -1,1391 +1,959 @@
 // SPDX-License-Identifier: GPL-2.0
-// Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.
+/*
+ * Copyright (c) 2018, 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2023-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+ */
 
-#define pr_fmt(fmt) "%s: " fmt, __func__
-
-#include <linux/err.h>
+#include <linux/bitfield.h>
+#include <linux/cpufreq.h>
+#include <linux/init.h>
+#include <linux/interconnect.h>
+#include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/of.h>
-#include <linux/of_device.h>
-#include <linux/platform_device.h>
+#include <linux/of_address.h>
+#include <linux/of_platform.h>
+#include <linux/pm_opp.h>
 #include <linux/slab.h>
-#include <linux/string.h>
-#include <linux/regulator/driver.h>
-#include <linux/regulator/machine.h>
-#include <linux/regulator/of_regulator.h>
+#include <linux/spinlock.h>
+#include <linux/qcom-cpufreq-hw.h>
+#include <linux/topology.h>
 
-#include <soc/qcom/cmd-db.h>
-#include <soc/qcom/rpmh.h>
+#define CREATE_TRACE_POINTS
+#include <trace/events/dcvsh.h>
+#include <linux/units.h>
 
-#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+#define LUT_MAX_ENTRIES			40U
+#define LUT_SRC				GENMASK(31, 30)
+#define LUT_L_VAL			GENMASK(7, 0)
+#define LUT_CORE_COUNT			GENMASK(18, 16)
+#define LUT_VOLT			GENMASK(11, 0)
+#define CLK_HW_DIV			2
+#define LUT_TURBO_IND			1
+#define MAX_FN_SIZE			20
 
-/**
- * enum rpmh_regulator_type - supported RPMh accelerator types
- * @VRM:	RPMh VRM accelerator which supports voting on enable, voltage,
- *		and mode of LDO, SMPS, and BOB type PMIC regulators.
- * @XOB:	RPMh XOB accelerator which supports voting on the enable state
- *		of PMIC regulators.
- */
-enum rpmh_regulator_type {
-	VRM,
-	XOB,
+#define GT_IRQ_STATUS			BIT(2)
+
+#define CYCLE_CNTR_OFFSET(core_id, m, acc_count)		\
+				(acc_count ? ((core_id + 1) * 4) : 0)
+
+struct cpufreq_counter {
+	u64 total_cycle_counter;
+	u32 prev_cycle_counter;
+	spinlock_t lock;
 };
 
-#define RPMH_REGULATOR_REG_VRM_VOLTAGE		0x0
-#define RPMH_REGULATOR_REG_ENABLE		0x4
-#define RPMH_REGULATOR_REG_VRM_MODE		0x8
+static struct cpufreq_counter qcom_cpufreq_counter[NR_CPUS];
 
-#define PMIC4_LDO_MODE_RETENTION		4
-#define PMIC4_LDO_MODE_LPM			5
-#define PMIC4_LDO_MODE_HPM			7
-
-#define PMIC4_SMPS_MODE_RETENTION		4
-#define PMIC4_SMPS_MODE_PFM			5
-#define PMIC4_SMPS_MODE_AUTO			6
-#define PMIC4_SMPS_MODE_PWM			7
-
-#define PMIC4_BOB_MODE_PASS			0
-#define PMIC4_BOB_MODE_PFM			1
-#define PMIC4_BOB_MODE_AUTO			2
-#define PMIC4_BOB_MODE_PWM			3
-
-#define PMIC5_LDO_MODE_RETENTION		3
-#define PMIC5_LDO_MODE_LPM			4
-#define PMIC5_LDO_MODE_HPM			7
-
-#define PMIC5_SMPS_MODE_RETENTION		3
-#define PMIC5_SMPS_MODE_PFM			4
-#define PMIC5_SMPS_MODE_AUTO			6
-#define PMIC5_SMPS_MODE_PWM			7
-
-#define PMIC5_BOB_MODE_PASS			2
-#define PMIC5_BOB_MODE_PFM			4
-#define PMIC5_BOB_MODE_AUTO			6
-#define PMIC5_BOB_MODE_PWM			7
-
-/**
- * struct rpmh_vreg_hw_data - RPMh regulator hardware configurations
- * @regulator_type:		RPMh accelerator type used to manage this
- *				regulator
- * @ops:			Pointer to regulator ops callback structure
- * @voltage_range:		The single range of voltages supported by this
- *				PMIC regulator type
- * @n_voltages:			The number of unique voltage set points defined
- *				by voltage_range
- * @hpm_min_load_uA:		Minimum load current in microamps that requires
- *				high power mode (HPM) operation.  This is used
- *				for LDO hardware type regulators only.
- * @pmic_mode_map:		Array indexed by regulator framework mode
- *				containing PMIC hardware modes.  Must be large
- *				enough to index all framework modes supported
- *				by this regulator hardware type.
- * @of_map_mode:		Maps an RPMH_REGULATOR_MODE_* mode value defined
- *				in device tree to a regulator framework mode
- */
-struct rpmh_vreg_hw_data {
-	enum rpmh_regulator_type		regulator_type;
-	const struct regulator_ops		*ops;
-	const struct linear_range	voltage_range;
-	int					n_voltages;
-	int					hpm_min_load_uA;
-	const int				*pmic_mode_map;
-	unsigned int			      (*of_map_mode)(unsigned int mode);
+struct qcom_cpufreq_soc_data {
+	u32 reg_enable;
+	u32 reg_domain_state;
+	u32 reg_dcvs_ctrl;
+	u32 reg_freq_lut;
+	u32 reg_volt_lut;
+	u32 reg_intr_clr;
+	u32 reg_current_vote;
+	u32 reg_perf_state;
+	u32 reg_cycle_cntr;
+	u32 lut_max_entries;
+	u8 lut_row_size;
+	bool accumulative_counter;
+	bool turbo_ind_support;
+	bool perf_lock_support;
 };
 
-/**
- * struct rpmh_vreg - individual RPMh regulator data structure encapsulating a
- *		single regulator device
- * @dev:			Device pointer for the top-level PMIC RPMh
- *				regulator parent device.  This is used as a
- *				handle in RPMh write requests.
- * @addr:			Base address of the regulator resource within
- *				an RPMh accelerator
- * @rdesc:			Regulator descriptor
- * @hw_data:			PMIC regulator configuration data for this RPMh
- *				regulator
- * @always_wait_for_ack:	Boolean flag indicating if a request must always
- *				wait for an ACK from RPMh before continuing even
- *				if it corresponds to a strictly lower power
- *				state (e.g. enabled --> disabled).
- * @enabled:			Flag indicating if the regulator is enabled or
- *				not
- * @bypassed:			Boolean indicating if the regulator is in
- *				bypass (pass-through) mode or not.  This is
- *				only used by BOB rpmh-regulator resources.
- * @voltage_selector:		Selector used for get_voltage_sel() and
- *				set_voltage_sel() callbacks
- * @mode:			RPMh VRM regulator current framework mode
- */
-struct rpmh_vreg {
-	struct device			*dev;
-	u32				addr;
-	struct regulator_desc		rdesc;
-	const struct rpmh_vreg_hw_data	*hw_data;
-	bool				always_wait_for_ack;
+struct qcom_cpufreq_data {
+	void __iomem *base;
+	void __iomem *pdmem_base;
+	struct resource *res;
+	const struct qcom_cpufreq_soc_data *soc_data;
 
-	int				enabled;
-	bool				bypassed;
-	int				voltage_selector;
-	unsigned int			mode;
+	/*
+	 * Mutex to synchronize between de-init sequence and re-starting LMh
+	 * polling/interrupts
+	 */
+	struct mutex throttle_lock;
+	int hw_clk_domain;
+	int throttle_irq;
+	char irq_name[15];
+	bool cancel_throttle;
+	struct delayed_work throttle_work;
+	struct cpufreq_policy *policy;
+	unsigned long last_non_boost_freq;
+
+	bool per_core_dcvs;
+	unsigned long dcvsh_freq_limit;
+	struct device_attribute freq_limit_attr;
 };
 
-/**
- * struct rpmh_vreg_init_data - initialization data for an RPMh regulator
- * @name:			Name for the regulator which also corresponds
- *				to the device tree subnode name of the regulator
- * @resource_name:		RPMh regulator resource name format string.
- *				This must include exactly one field: '%s' which
- *				is filled at run-time with the PMIC ID provided
- *				by device tree property qcom,pmic-id.  Example:
- *				"ldo%s1" for RPMh resource "ldoa1".
- * @supply_name:		Parent supply regulator name
- * @hw_data:			Configuration data for this PMIC regulator type
- */
-struct rpmh_vreg_init_data {
-	const char			*name;
-	const char			*resource_name;
-	const char			*supply_name;
-	const struct rpmh_vreg_hw_data	*hw_data;
-};
+static unsigned long cpu_hw_rate, xo_rate;
+static bool icc_scaling_enabled;
 
-/**
- * rpmh_regulator_send_request() - send the request to RPMh
- * @vreg:		Pointer to the RPMh regulator
- * @cmd:		Pointer to the RPMh command to send
- * @wait_for_ack:	Boolean indicating if execution must wait until the
- *			request has been acknowledged as complete
- *
- * Return: 0 on success, errno on failure
+/*
+ * show_hw_clk_domain - the HW clock domain per policy
  */
-static int rpmh_regulator_send_request(struct rpmh_vreg *vreg,
-			struct tcs_cmd *cmd, bool wait_for_ack)
+static ssize_t show_hw_clk_domain(struct cpufreq_policy *policy, char *buf)
 {
+	struct qcom_cpufreq_data *data;
+
+	data = policy->driver_data;
+	if (data)
+		return scnprintf(buf, sizeof(int), "%u\n", data->hw_clk_domain);
+
+	return -EIO;
+}
+
+cpufreq_freq_attr_ro(hw_clk_domain);
+
+static int qcom_cpufreq_set_bw(struct cpufreq_policy *policy,
+			       unsigned long freq_khz)
+{
+	unsigned long freq_hz = freq_khz * 1000;
+	struct dev_pm_opp *opp;
+	struct device *dev;
 	int ret;
 
-	if (wait_for_ack || vreg->always_wait_for_ack)
-		ret = rpmh_write(vreg->dev, RPMH_ACTIVE_ONLY_STATE, cmd, 1);
-	else
-		ret = rpmh_write_async(vreg->dev, RPMH_ACTIVE_ONLY_STATE, cmd,
-					1);
+	dev = get_cpu_device(policy->cpu);
+	if (!dev)
+		return -ENODEV;
 
+	opp = dev_pm_opp_find_freq_exact(dev, freq_hz, true);
+	if (IS_ERR(opp))
+		return PTR_ERR(opp);
+
+	ret = dev_pm_opp_set_opp(dev, opp);
+	dev_pm_opp_put(opp);
 	return ret;
 }
 
-static int _rpmh_regulator_vrm_set_voltage_sel(struct regulator_dev *rdev,
-				unsigned int selector, bool wait_for_ack)
+static int qcom_cpufreq_update_opp(struct device *cpu_dev,
+				   unsigned long freq_khz,
+				   unsigned long volt)
 {
-	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
-	struct tcs_cmd cmd = {
-		.addr = vreg->addr + RPMH_REGULATOR_REG_VRM_VOLTAGE,
-	};
+	unsigned long freq_hz = freq_khz * 1000;
 	int ret;
 
-	/* VRM voltage control register is set with voltage in millivolts. */
-	cmd.data = DIV_ROUND_UP(regulator_list_voltage_linear_range(rdev,
-							selector), 1000);
+	/* Skip voltage update if the opp table is not available */
+	if (!icc_scaling_enabled)
+		return dev_pm_opp_add(cpu_dev, freq_hz, volt);
 
-	ret = rpmh_regulator_send_request(vreg, &cmd, wait_for_ack);
-	if (!ret)
-		vreg->voltage_selector = selector;
-
-	return ret;
-}
-
-static int rpmh_regulator_vrm_set_voltage_sel(struct regulator_dev *rdev,
-					unsigned int selector)
-{
-	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
-
-	if (vreg->enabled == -EINVAL) {
-		/*
-		 * Cache the voltage and send it later when the regulator is
-		 * enabled or disabled.
-		 */
-		vreg->voltage_selector = selector;
-		return 0;
+	ret = dev_pm_opp_adjust_voltage(cpu_dev, freq_hz, volt, volt, volt);
+	if (ret) {
+		dev_err(cpu_dev, "Voltage update failed freq=%ld\n", freq_khz);
+		return ret;
 	}
 
-	return _rpmh_regulator_vrm_set_voltage_sel(rdev, selector,
-					selector > vreg->voltage_selector);
+	return dev_pm_opp_enable(cpu_dev, freq_hz);
 }
 
-static int rpmh_regulator_vrm_get_voltage_sel(struct regulator_dev *rdev)
+u64 qcom_cpufreq_get_cpu_cycle_counter(int cpu)
 {
-	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
+	const struct qcom_cpufreq_soc_data *soc_data;
+	struct cpufreq_counter *cpu_counter;
+	struct qcom_cpufreq_data *data;
+	struct cpufreq_policy *policy;
+	u64 cycle_counter_ret;
+	unsigned long flags;
+	u16 offset;
+	u32 val;
 
-	return vreg->voltage_selector;
+	policy = cpufreq_cpu_get_raw(cpu);
+	if (!policy)
+		return 0;
+
+	data = policy->driver_data;
+	soc_data = data->soc_data;
+
+	cpu_counter = &qcom_cpufreq_counter[cpu];
+	spin_lock_irqsave(&cpu_counter->lock, flags);
+
+	offset = CYCLE_CNTR_OFFSET(topology_core_id(cpu), policy->related_cpus,
+					soc_data->accumulative_counter);
+	val = readl_relaxed(data->base +
+					soc_data->reg_cycle_cntr + offset);
+
+	if (val < cpu_counter->prev_cycle_counter) {
+		/* Handle counter overflow */
+		cpu_counter->total_cycle_counter += UINT_MAX -
+			cpu_counter->prev_cycle_counter + val;
+		cpu_counter->prev_cycle_counter = val;
+	} else {
+		cpu_counter->total_cycle_counter += val -
+			cpu_counter->prev_cycle_counter;
+		cpu_counter->prev_cycle_counter = val;
+	}
+	cycle_counter_ret = cpu_counter->total_cycle_counter;
+	spin_unlock_irqrestore(&cpu_counter->lock, flags);
+
+	pr_debug("CPU %u, core-id 0x%x, offset %u\n", cpu, topology_core_id(cpu), offset);
+
+	return cycle_counter_ret;
 }
+EXPORT_SYMBOL(qcom_cpufreq_get_cpu_cycle_counter);
 
-static int rpmh_regulator_is_enabled(struct regulator_dev *rdev)
+static int qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
+					unsigned int index)
 {
-	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
+	struct qcom_cpufreq_data *data = policy->driver_data;
+	const struct qcom_cpufreq_soc_data *soc_data = data->soc_data;
+	unsigned long freq = policy->freq_table[index].frequency;
+	unsigned int i;
 
-	return vreg->enabled;
-}
-
-static int rpmh_regulator_set_enable_state(struct regulator_dev *rdev,
-					bool enable)
-{
-	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
-	struct tcs_cmd cmd = {
-		.addr = vreg->addr + RPMH_REGULATOR_REG_ENABLE,
-		.data = enable,
-	};
-	int ret;
-
-	if (vreg->enabled == -EINVAL &&
-	    vreg->voltage_selector != -ENOTRECOVERABLE) {
-		ret = _rpmh_regulator_vrm_set_voltage_sel(rdev,
-						vreg->voltage_selector, true);
-		if (ret < 0)
-			return ret;
+	if (soc_data->perf_lock_support) {
+		if (data->pdmem_base)
+			writel_relaxed(index, data->pdmem_base);
 	}
 
-	ret = rpmh_regulator_send_request(vreg, &cmd, enable);
-	if (!ret)
-		vreg->enabled = enable;
+	writel_relaxed(index, data->base + soc_data->reg_perf_state);
 
-	return ret;
-}
+	if (data->per_core_dcvs)
+		for (i = 1; i < cpumask_weight(policy->related_cpus); i++)
+			writel_relaxed(index, data->base + soc_data->reg_perf_state + i * 4);
 
-static int rpmh_regulator_enable(struct regulator_dev *rdev)
-{
-	return rpmh_regulator_set_enable_state(rdev, true);
-}
-
-static int rpmh_regulator_disable(struct regulator_dev *rdev)
-{
-	return rpmh_regulator_set_enable_state(rdev, false);
-}
-
-static int rpmh_regulator_vrm_set_mode_bypass(struct rpmh_vreg *vreg,
-					unsigned int mode, bool bypassed)
-{
-	struct tcs_cmd cmd = {
-		.addr = vreg->addr + RPMH_REGULATOR_REG_VRM_MODE,
-	};
-	int pmic_mode;
-
-	if (mode > REGULATOR_MODE_STANDBY)
-		return -EINVAL;
-
-	pmic_mode = vreg->hw_data->pmic_mode_map[mode];
-	if (pmic_mode < 0)
-		return pmic_mode;
-
-	if (bypassed)
-		cmd.data = PMIC4_BOB_MODE_PASS;
-	else
-		cmd.data = pmic_mode;
-
-	return rpmh_regulator_send_request(vreg, &cmd, true);
-}
-
-static int rpmh_regulator_vrm_set_mode(struct regulator_dev *rdev,
-					unsigned int mode)
-{
-	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
-	int ret;
-
-	if (mode == vreg->mode)
-		return 0;
-
-	ret = rpmh_regulator_vrm_set_mode_bypass(vreg, mode, vreg->bypassed);
-	if (!ret)
-		vreg->mode = mode;
-
-	return ret;
-}
-
-static unsigned int rpmh_regulator_vrm_get_mode(struct regulator_dev *rdev)
-{
-	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
-
-	return vreg->mode;
-}
-
-/**
- * rpmh_regulator_vrm_get_optimum_mode() - get the mode based on the  load
- * @rdev:		Regulator device pointer for the rpmh-regulator
- * @input_uV:		Input voltage
- * @output_uV:		Output voltage
- * @load_uA:		Aggregated load current in microamps
- *
- * This function is used in the regulator_ops for VRM type RPMh regulator
- * devices.
- *
- * Return: 0 on success, errno on failure
- */
-static unsigned int rpmh_regulator_vrm_get_optimum_mode(
-	struct regulator_dev *rdev, int input_uV, int output_uV, int load_uA)
-{
-	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
-
-	if (load_uA >= vreg->hw_data->hpm_min_load_uA)
-		return REGULATOR_MODE_NORMAL;
-	else
-		return REGULATOR_MODE_IDLE;
-}
-
-static int rpmh_regulator_vrm_set_bypass(struct regulator_dev *rdev,
-				bool enable)
-{
-	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
-	int ret;
-
-	if (vreg->bypassed == enable)
-		return 0;
-
-	ret = rpmh_regulator_vrm_set_mode_bypass(vreg, vreg->mode, enable);
-	if (!ret)
-		vreg->bypassed = enable;
-
-	return ret;
-}
-
-static int rpmh_regulator_vrm_get_bypass(struct regulator_dev *rdev,
-				bool *enable)
-{
-	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
-
-	*enable = vreg->bypassed;
+	if (icc_scaling_enabled)
+		qcom_cpufreq_set_bw(policy, freq);
 
 	return 0;
 }
 
-static const struct regulator_ops rpmh_regulator_vrm_ops = {
-	.enable			= rpmh_regulator_enable,
-	.disable		= rpmh_regulator_disable,
-	.is_enabled		= rpmh_regulator_is_enabled,
-	.set_voltage_sel	= rpmh_regulator_vrm_set_voltage_sel,
-	.get_voltage_sel	= rpmh_regulator_vrm_get_voltage_sel,
-	.list_voltage		= regulator_list_voltage_linear_range,
-	.set_mode		= rpmh_regulator_vrm_set_mode,
-	.get_mode		= rpmh_regulator_vrm_get_mode,
-};
-
-static const struct regulator_ops rpmh_regulator_vrm_drms_ops = {
-	.enable			= rpmh_regulator_enable,
-	.disable		= rpmh_regulator_disable,
-	.is_enabled		= rpmh_regulator_is_enabled,
-	.set_voltage_sel	= rpmh_regulator_vrm_set_voltage_sel,
-	.get_voltage_sel	= rpmh_regulator_vrm_get_voltage_sel,
-	.list_voltage		= regulator_list_voltage_linear_range,
-	.set_mode		= rpmh_regulator_vrm_set_mode,
-	.get_mode		= rpmh_regulator_vrm_get_mode,
-	.get_optimum_mode	= rpmh_regulator_vrm_get_optimum_mode,
-};
-
-static const struct regulator_ops rpmh_regulator_vrm_bypass_ops = {
-	.enable			= rpmh_regulator_enable,
-	.disable		= rpmh_regulator_disable,
-	.is_enabled		= rpmh_regulator_is_enabled,
-	.set_voltage_sel	= rpmh_regulator_vrm_set_voltage_sel,
-	.get_voltage_sel	= rpmh_regulator_vrm_get_voltage_sel,
-	.list_voltage		= regulator_list_voltage_linear_range,
-	.set_mode		= rpmh_regulator_vrm_set_mode,
-	.get_mode		= rpmh_regulator_vrm_get_mode,
-	.set_bypass		= rpmh_regulator_vrm_set_bypass,
-	.get_bypass		= rpmh_regulator_vrm_get_bypass,
-};
-
-static const struct regulator_ops rpmh_regulator_xob_ops = {
-	.enable			= rpmh_regulator_enable,
-	.disable		= rpmh_regulator_disable,
-	.is_enabled		= rpmh_regulator_is_enabled,
-};
-
-/**
- * rpmh_regulator_init_vreg() - initialize all attributes of an rpmh-regulator
- * @vreg:		Pointer to the individual rpmh-regulator resource
- * @dev:			Pointer to the top level rpmh-regulator PMIC device
- * @node:		Pointer to the individual rpmh-regulator resource
- *			device node
- * @pmic_id:		String used to identify the top level rpmh-regulator
- *			PMIC device on the board
- * @pmic_rpmh_data:	Pointer to a null-terminated array of rpmh-regulator
- *			resources defined for the top level PMIC device
- *
- * Return: 0 on success, errno on failure
- */
-static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg, struct device *dev,
-			struct device_node *node, const char *pmic_id,
-			const struct rpmh_vreg_init_data *pmic_rpmh_data)
+static unsigned long qcom_lmh_get_throttle_freq(struct qcom_cpufreq_data *data)
 {
-	struct regulator_config reg_config = {};
-	char rpmh_resource_name[20] = "";
-	const struct rpmh_vreg_init_data *rpmh_data;
-	struct regulator_init_data *init_data;
-	struct regulator_dev *rdev;
+	unsigned int lval;
+
+	if (data->soc_data->reg_current_vote)
+		lval = readl_relaxed(data->base + data->soc_data->reg_current_vote) & 0x3ff;
+	else
+		lval = readl_relaxed(data->base + data->soc_data->reg_domain_state) & 0xff;
+
+	return lval * xo_rate;
+}
+
+/* Get the frequency requested by the cpufreq core for the CPU */
+static unsigned int qcom_cpufreq_get_freq(unsigned int cpu)
+{
+	struct qcom_cpufreq_data *data;
+	const struct qcom_cpufreq_soc_data *soc_data;
+	struct cpufreq_policy *policy;
+	unsigned int index;
+
+	policy = cpufreq_cpu_get_raw(cpu);
+	if (!policy)
+		return 0;
+
+	data = policy->driver_data;
+	soc_data = data->soc_data;
+
+	index = readl_relaxed(data->base + soc_data->reg_perf_state);
+	index = min(index, soc_data->lut_max_entries - 1);
+
+	return policy->freq_table[index].frequency;
+}
+
+static unsigned int qcom_cpufreq_hw_get(unsigned int cpu)
+{
+	struct qcom_cpufreq_data *data;
+	struct cpufreq_policy *policy;
+
+	policy = cpufreq_cpu_get_raw(cpu);
+	if (!policy)
+		return 0;
+
+	data = policy->driver_data;
+
+	if (data->throttle_irq >= 0)
+		return qcom_lmh_get_throttle_freq(data) / HZ_PER_KHZ;
+
+	return qcom_cpufreq_get_freq(cpu);
+}
+
+static unsigned int qcom_cpufreq_hw_fast_switch(struct cpufreq_policy *policy,
+						unsigned int target_freq)
+{
+	struct qcom_cpufreq_data *data = policy->driver_data;
+	const struct qcom_cpufreq_soc_data *soc_data = data->soc_data;
+	unsigned int index;
+	unsigned int i;
+
+	index = policy->cached_resolved_idx;
+	writel_relaxed(index, data->base + soc_data->reg_perf_state);
+
+	if (data->per_core_dcvs)
+		for (i = 1; i < cpumask_weight(policy->related_cpus); i++)
+			writel_relaxed(index, data->base + soc_data->reg_perf_state + i * 4);
+
+	return policy->freq_table[index].frequency;
+}
+
+static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
+				    struct cpufreq_policy *policy)
+{
+	u32 data, src, lval, i, core_count, prev_freq = 0, freq;
+	u32 volt, max_cc = 0;
+	struct cpufreq_frequency_table	*table;
+	struct dev_pm_opp *opp;
+	unsigned long rate;
 	int ret;
+	struct qcom_cpufreq_data *drv_data = policy->driver_data;
+	const struct qcom_cpufreq_soc_data *soc_data = drv_data->soc_data;
 
-	vreg->dev = dev;
-
-	for (rpmh_data = pmic_rpmh_data; rpmh_data->name; rpmh_data++)
-		if (of_node_name_eq(node, rpmh_data->name))
-			break;
-
-	if (!rpmh_data->name) {
-		dev_err(dev, "Unknown regulator %pOFn\n", node);
-		return -EINVAL;
-	}
-
-	scnprintf(rpmh_resource_name, sizeof(rpmh_resource_name),
-		rpmh_data->resource_name, pmic_id);
-
-	vreg->addr = cmd_db_read_addr(rpmh_resource_name);
-	if (!vreg->addr) {
-		dev_err(dev, "%pOFn: could not find RPMh address for resource %s\n",
-			node, rpmh_resource_name);
-		return -ENODEV;
-	}
-
-	vreg->rdesc.name = rpmh_data->name;
-	vreg->rdesc.supply_name = rpmh_data->supply_name;
-	vreg->hw_data = rpmh_data->hw_data;
-
-	vreg->enabled = -EINVAL;
-	vreg->voltage_selector = -ENOTRECOVERABLE;
-	vreg->mode = REGULATOR_MODE_INVALID;
-
-	if (rpmh_data->hw_data->n_voltages) {
-		vreg->rdesc.linear_ranges = &rpmh_data->hw_data->voltage_range;
-		vreg->rdesc.n_linear_ranges = 1;
-		vreg->rdesc.n_voltages = rpmh_data->hw_data->n_voltages;
-	}
-
-	vreg->always_wait_for_ack = of_property_read_bool(node,
-						"qcom,always-wait-for-ack");
-
-	vreg->rdesc.owner	= THIS_MODULE;
-	vreg->rdesc.type	= REGULATOR_VOLTAGE;
-	vreg->rdesc.ops		= vreg->hw_data->ops;
-	vreg->rdesc.of_map_mode	= vreg->hw_data->of_map_mode;
-
-	init_data = of_get_regulator_init_data(dev, node, &vreg->rdesc);
-	if (!init_data)
+	table = kcalloc(soc_data->lut_max_entries + 1, sizeof(*table), GFP_KERNEL);
+	if (!table)
 		return -ENOMEM;
 
-	if (rpmh_data->hw_data->regulator_type == XOB &&
-	    init_data->constraints.min_uV &&
-	    init_data->constraints.min_uV == init_data->constraints.max_uV) {
-		vreg->rdesc.fixed_uV = init_data->constraints.min_uV;
-		vreg->rdesc.n_voltages = 1;
-	}
+	ret = dev_pm_opp_of_add_table(cpu_dev);
+	if (!ret) {
+		/* Disable all opps and cross-validate against LUT later */
+		icc_scaling_enabled = true;
+		for (rate = 0; ; rate++) {
+			opp = dev_pm_opp_find_freq_ceil(cpu_dev, &rate);
+			if (IS_ERR(opp))
+				break;
 
-	reg_config.dev		= dev;
-	reg_config.init_data	= init_data;
-	reg_config.of_node	= node;
-	reg_config.driver_data	= vreg;
-
-	rdev = devm_regulator_register(dev, &vreg->rdesc, &reg_config);
-	if (IS_ERR(rdev)) {
-		ret = PTR_ERR(rdev);
-		dev_err(dev, "%pOFn: devm_regulator_register() failed, ret=%d\n",
-			node, ret);
+			dev_pm_opp_put(opp);
+			dev_pm_opp_disable(cpu_dev, rate);
+		}
+	} else if (ret != -ENODEV) {
+		dev_err(cpu_dev, "Invalid opp table in device tree\n");
+		kfree(table);
 		return ret;
+	} else {
+		policy->fast_switch_possible = true;
+		icc_scaling_enabled = false;
 	}
 
-	dev_dbg(dev, "%pOFn regulator registered for RPMh resource %s @ 0x%05X\n",
-		node, rpmh_resource_name, vreg->addr);
+	for (i = 0; i < soc_data->lut_max_entries; i++) {
+		data = readl_relaxed(drv_data->base + soc_data->reg_freq_lut +
+				      i * soc_data->lut_row_size);
+		src = FIELD_GET(LUT_SRC, data);
+		lval = FIELD_GET(LUT_L_VAL, data);
+		core_count = FIELD_GET(LUT_CORE_COUNT, data);
+
+		if (i == 0)
+			max_cc = core_count;
+
+		data = readl_relaxed(drv_data->base + soc_data->reg_volt_lut +
+				      i * soc_data->lut_row_size);
+		volt = FIELD_GET(LUT_VOLT, data) * 1000;
+
+		if (src)
+			freq = xo_rate * lval / 1000;
+		else
+			freq = cpu_hw_rate / 1000;
+
+		if (core_count == LUT_TURBO_IND && soc_data->turbo_ind_support)
+			table[i].frequency = CPUFREQ_ENTRY_INVALID;
+		else if (freq != prev_freq) {
+			if (!qcom_cpufreq_update_opp(cpu_dev, freq, volt)) {
+				table[i].frequency = freq;
+				if (core_count < max_cc)
+					table[i].flags = CPUFREQ_BOOST_FREQ;
+				dev_dbg(cpu_dev, "index=%d freq=%d, core_count %d\n", i,
+				freq, core_count);
+			} else {
+				dev_warn(cpu_dev, "failed to update OPP for freq=%d\n", freq);
+				table[i].frequency = CPUFREQ_ENTRY_INVALID;
+			}
+		}
+
+		/*
+		 * Two of the same frequencies with the same core counts means
+		 * end of table
+		 */
+		if (i > 0 && prev_freq == freq) {
+			struct cpufreq_frequency_table *prev = &table[i - 1];
+
+			/*
+			 * Only treat the last frequency that might be a boost
+			 * as the boost frequency
+			 */
+			if (prev->frequency == CPUFREQ_ENTRY_INVALID) {
+				if (!qcom_cpufreq_update_opp(cpu_dev, prev_freq, volt)) {
+					prev->frequency = prev_freq;
+					prev->flags = CPUFREQ_BOOST_FREQ;
+				} else {
+					dev_warn(cpu_dev, "failed to update OPP for freq=%d\n",
+						 freq);
+				}
+			}
+
+			break;
+		}
+
+		prev_freq = freq;
+	}
+
+	table[i].frequency = CPUFREQ_TABLE_END;
+	policy->freq_table = table;
+
+	for (i = 0; i < soc_data->lut_max_entries && table[i].frequency != CPUFREQ_TABLE_END; i++) {
+		if (table[i].flags == CPUFREQ_BOOST_FREQ)
+			break;
+
+		drv_data->last_non_boost_freq = table[i].frequency;
+	}
+
+	dev_pm_opp_set_sharing_cpus(cpu_dev, policy->cpus);
 
 	return 0;
 }
 
-static const int pmic_mode_map_pmic4_ldo[REGULATOR_MODE_STANDBY + 1] = {
-	[REGULATOR_MODE_INVALID] = -EINVAL,
-	[REGULATOR_MODE_STANDBY] = PMIC4_LDO_MODE_RETENTION,
-	[REGULATOR_MODE_IDLE]    = PMIC4_LDO_MODE_LPM,
-	[REGULATOR_MODE_NORMAL]  = PMIC4_LDO_MODE_HPM,
-	[REGULATOR_MODE_FAST]    = -EINVAL,
-};
-
-static const int pmic_mode_map_pmic5_ldo[REGULATOR_MODE_STANDBY + 1] = {
-	[REGULATOR_MODE_INVALID] = -EINVAL,
-	[REGULATOR_MODE_STANDBY] = PMIC5_LDO_MODE_RETENTION,
-	[REGULATOR_MODE_IDLE]    = PMIC5_LDO_MODE_LPM,
-	[REGULATOR_MODE_NORMAL]  = PMIC5_LDO_MODE_HPM,
-	[REGULATOR_MODE_FAST]    = -EINVAL,
-};
-
-static unsigned int rpmh_regulator_pmic4_ldo_of_map_mode(unsigned int rpmh_mode)
+static void qcom_get_related_cpus(int index, struct cpumask *m)
 {
-	unsigned int mode;
+	struct device_node *cpu_np;
+	struct of_phandle_args args;
+	int cpu, ret;
 
-	switch (rpmh_mode) {
-	case RPMH_REGULATOR_MODE_HPM:
-		mode = REGULATOR_MODE_NORMAL;
-		break;
-	case RPMH_REGULATOR_MODE_LPM:
-		mode = REGULATOR_MODE_IDLE;
-		break;
-	case RPMH_REGULATOR_MODE_RET:
-		mode = REGULATOR_MODE_STANDBY;
-		break;
-	default:
-		mode = REGULATOR_MODE_INVALID;
-		break;
+	for_each_possible_cpu(cpu) {
+		cpu_np = of_cpu_device_node_get(cpu);
+		if (!cpu_np)
+			continue;
+
+		ret = of_parse_phandle_with_args(cpu_np, "qcom,freq-domain",
+						 "#freq-domain-cells", 0,
+						 &args);
+		of_node_put(cpu_np);
+		if (ret < 0)
+			continue;
+
+		if (index == args.args[0])
+			cpumask_set_cpu(cpu, m);
+	}
+}
+
+static ssize_t dcvsh_freq_limit_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct qcom_cpufreq_data *c = container_of(attr, struct qcom_cpufreq_data,
+						   freq_limit_attr);
+	return scnprintf(buf, PAGE_SIZE, "%lu\n", c->dcvsh_freq_limit);
+}
+
+static void qcom_lmh_dcvs_notify(struct qcom_cpufreq_data *data)
+{
+	struct cpufreq_policy *policy = data->policy;
+	int cpu = cpumask_first(policy->related_cpus);
+	struct device *dev = get_cpu_device(cpu);
+	unsigned long freq_hz, throttled_freq, thermal_pressure;
+	struct dev_pm_opp *opp;
+
+	if (!dev)
+		return;
+
+	/*
+	 * Get the h/w throttled frequency, normalize it using the
+	 * registered opp table and use it to calculate thermal pressure.
+	 */
+	freq_hz = qcom_lmh_get_throttle_freq(data);
+
+	opp = dev_pm_opp_find_freq_floor(dev, &freq_hz);
+	if (IS_ERR(opp) && PTR_ERR(opp) == -ERANGE)
+		opp = dev_pm_opp_find_freq_ceil(dev, &freq_hz);
+
+	if (IS_ERR(opp))
+		dev_warn(dev, "Can't find the OPP for throttling: %pe!\n", opp);
+	else
+		dev_pm_opp_put(opp);
+
+	throttled_freq = thermal_pressure = freq_hz / HZ_PER_KHZ;
+
+	/*
+	 * In the unlikely case policy is unregistered do not enable
+	 * polling or h/w interrupt
+	 */
+	mutex_lock(&data->throttle_lock);
+	if (data->cancel_throttle)
+		goto out;
+
+	/*
+	 * If h/w throttled frequency is higher than what cpufreq has requested
+	 * for, then stop polling and switch back to interrupt mechanism.
+	 */
+	if (throttled_freq >= qcom_cpufreq_get_freq(cpu)) {
+		thermal_pressure = policy->cpuinfo.max_freq;
+
+		enable_irq(data->throttle_irq);
+		trace_dcvsh_throttle(cpu, 0);
+	} else {
+		/*
+		 * If the frequency is at least the highest, non-boost
+		 * frequency, then the delta vs. what's requested is likely due
+		 * to core-count boost limitations and shouldn't be
+		 * communicated as thermal pressure.
+		 */
+		if (throttled_freq >= data->last_non_boost_freq)
+			thermal_pressure = policy->cpuinfo.max_freq;
+
+		mod_delayed_work(system_highpri_wq, &data->throttle_work,
+				 msecs_to_jiffies(10));
 	}
 
-	return mode;
+	trace_dcvsh_freq(cpu, qcom_cpufreq_get_freq(cpu), throttled_freq, thermal_pressure);
+
+	/* Update thermal pressure (the boost frequencies are accepted) */
+	arch_update_thermal_pressure(policy->related_cpus, thermal_pressure);
+	data->dcvsh_freq_limit = thermal_pressure;
+
+out:
+	mutex_unlock(&data->throttle_lock);
 }
 
-static const int pmic_mode_map_pmic4_smps[REGULATOR_MODE_STANDBY + 1] = {
-	[REGULATOR_MODE_INVALID] = -EINVAL,
-	[REGULATOR_MODE_STANDBY] = PMIC4_SMPS_MODE_RETENTION,
-	[REGULATOR_MODE_IDLE]    = PMIC4_SMPS_MODE_PFM,
-	[REGULATOR_MODE_NORMAL]  = PMIC4_SMPS_MODE_AUTO,
-	[REGULATOR_MODE_FAST]    = PMIC4_SMPS_MODE_PWM,
-};
-
-static const int pmic_mode_map_pmic5_smps[REGULATOR_MODE_STANDBY + 1] = {
-	[REGULATOR_MODE_INVALID] = -EINVAL,
-	[REGULATOR_MODE_STANDBY] = PMIC5_SMPS_MODE_RETENTION,
-	[REGULATOR_MODE_IDLE]    = PMIC5_SMPS_MODE_PFM,
-	[REGULATOR_MODE_NORMAL]  = PMIC5_SMPS_MODE_AUTO,
-	[REGULATOR_MODE_FAST]    = PMIC5_SMPS_MODE_PWM,
-};
-
-static unsigned int
-rpmh_regulator_pmic4_smps_of_map_mode(unsigned int rpmh_mode)
+static void qcom_lmh_dcvs_poll(struct work_struct *work)
 {
-	unsigned int mode;
+	struct qcom_cpufreq_data *data;
 
-	switch (rpmh_mode) {
-	case RPMH_REGULATOR_MODE_HPM:
-		mode = REGULATOR_MODE_FAST;
-		break;
-	case RPMH_REGULATOR_MODE_AUTO:
-		mode = REGULATOR_MODE_NORMAL;
-		break;
-	case RPMH_REGULATOR_MODE_LPM:
-		mode = REGULATOR_MODE_IDLE;
-		break;
-	case RPMH_REGULATOR_MODE_RET:
-		mode = REGULATOR_MODE_STANDBY;
-		break;
-	default:
-		mode = REGULATOR_MODE_INVALID;
-		break;
-	}
-
-	return mode;
+	data = container_of(work, struct qcom_cpufreq_data, throttle_work.work);
+	qcom_lmh_dcvs_notify(data);
 }
 
-static const int pmic_mode_map_pmic4_bob[REGULATOR_MODE_STANDBY + 1] = {
-	[REGULATOR_MODE_INVALID] = -EINVAL,
-	[REGULATOR_MODE_STANDBY] = -EINVAL,
-	[REGULATOR_MODE_IDLE]    = PMIC4_BOB_MODE_PFM,
-	[REGULATOR_MODE_NORMAL]  = PMIC4_BOB_MODE_AUTO,
-	[REGULATOR_MODE_FAST]    = PMIC4_BOB_MODE_PWM,
-};
-
-static const int pmic_mode_map_pmic5_bob[REGULATOR_MODE_STANDBY + 1] = {
-	[REGULATOR_MODE_INVALID] = -EINVAL,
-	[REGULATOR_MODE_STANDBY] = -EINVAL,
-	[REGULATOR_MODE_IDLE]    = PMIC5_BOB_MODE_PFM,
-	[REGULATOR_MODE_NORMAL]  = PMIC5_BOB_MODE_AUTO,
-	[REGULATOR_MODE_FAST]    = PMIC5_BOB_MODE_PWM,
-};
-
-static unsigned int rpmh_regulator_pmic4_bob_of_map_mode(unsigned int rpmh_mode)
+static irqreturn_t qcom_lmh_dcvs_handle_irq(int irq, void *data)
 {
-	unsigned int mode;
+	struct qcom_cpufreq_data *c_data = data;
+	struct cpufreq_policy *policy = c_data->policy;
 
-	switch (rpmh_mode) {
-	case RPMH_REGULATOR_MODE_HPM:
-		mode = REGULATOR_MODE_FAST;
-		break;
-	case RPMH_REGULATOR_MODE_AUTO:
-		mode = REGULATOR_MODE_NORMAL;
-		break;
-	case RPMH_REGULATOR_MODE_LPM:
-		mode = REGULATOR_MODE_IDLE;
-		break;
-	default:
-		mode = REGULATOR_MODE_INVALID;
-		break;
-	}
+	/* Disable interrupt and enable polling */
+	disable_irq_nosync(c_data->throttle_irq);
+	trace_dcvsh_throttle(cpumask_first(policy->cpus), 1);
+	schedule_delayed_work(&c_data->throttle_work, 0);
 
-	return mode;
+	if (c_data->soc_data->reg_intr_clr)
+		writel_relaxed(GT_IRQ_STATUS,
+			       c_data->base + c_data->soc_data->reg_intr_clr);
+
+	return IRQ_HANDLED;
 }
 
-static const struct rpmh_vreg_hw_data pmic4_pldo = {
-	.regulator_type = VRM,
-	.ops = &rpmh_regulator_vrm_drms_ops,
-	.voltage_range = REGULATOR_LINEAR_RANGE(1664000, 0, 255, 8000),
-	.n_voltages = 256,
-	.hpm_min_load_uA = 10000,
-	.pmic_mode_map = pmic_mode_map_pmic4_ldo,
-	.of_map_mode = rpmh_regulator_pmic4_ldo_of_map_mode,
+static const struct qcom_cpufreq_soc_data qcom_soc_data = {
+	.reg_enable = 0x0,
+	.reg_dcvs_ctrl = 0xbc,
+	.reg_freq_lut = 0x110,
+	.reg_volt_lut = 0x114,
+	.reg_current_vote = 0x704,
+	.reg_perf_state = 0x920,
+	.reg_cycle_cntr = 0x9c0,
+	.lut_row_size = 32,
+	.lut_max_entries = LUT_MAX_ENTRIES,
+	.accumulative_counter = false,
+	.turbo_ind_support = true,
 };
 
-static const struct rpmh_vreg_hw_data pmic4_pldo_lv = {
-	.regulator_type = VRM,
-	.ops = &rpmh_regulator_vrm_drms_ops,
-	.voltage_range = REGULATOR_LINEAR_RANGE(1256000, 0, 127, 8000),
-	.n_voltages = 128,
-	.hpm_min_load_uA = 10000,
-	.pmic_mode_map = pmic_mode_map_pmic4_ldo,
-	.of_map_mode = rpmh_regulator_pmic4_ldo_of_map_mode,
+static const struct qcom_cpufreq_soc_data epss_soc_data = {
+	.reg_enable = 0x0,
+	.reg_domain_state = 0x20,
+	.reg_dcvs_ctrl = 0xb0,
+	.reg_freq_lut = 0x100,
+	.reg_volt_lut = 0x200,
+	.reg_intr_clr = 0x308,
+	.reg_perf_state = 0x320,
+	.reg_cycle_cntr = 0x3c4,
+	.lut_row_size = 4,
+	.lut_max_entries = LUT_MAX_ENTRIES,
+	.accumulative_counter = true,
+	.turbo_ind_support = false,
+	.perf_lock_support = false,
 };
 
-static const struct rpmh_vreg_hw_data pmic4_nldo = {
-	.regulator_type = VRM,
-	.ops = &rpmh_regulator_vrm_drms_ops,
-	.voltage_range = REGULATOR_LINEAR_RANGE(312000, 0, 127, 8000),
-	.n_voltages = 128,
-	.hpm_min_load_uA = 30000,
-	.pmic_mode_map = pmic_mode_map_pmic4_ldo,
-	.of_map_mode = rpmh_regulator_pmic4_ldo_of_map_mode,
+static const struct qcom_cpufreq_soc_data epss_pdmem_soc_data = {
+	.reg_enable = 0x0,
+	.reg_domain_state = 0x20,
+	.reg_dcvs_ctrl = 0xb0,
+	.reg_freq_lut = 0x100,
+	.reg_volt_lut = 0x200,
+	.reg_intr_clr = 0x308,
+	.reg_perf_state = 0x320,
+	.reg_cycle_cntr = 0x3c4,
+	.lut_row_size = 4,
+	.lut_max_entries = LUT_MAX_ENTRIES,
+	.accumulative_counter = true,
+	.turbo_ind_support = false,
+	.perf_lock_support = true,
 };
 
-static const struct rpmh_vreg_hw_data pmic4_hfsmps3 = {
-	.regulator_type = VRM,
-	.ops = &rpmh_regulator_vrm_ops,
-	.voltage_range = REGULATOR_LINEAR_RANGE(290000, 0, 215, 8000),
-	.n_voltages = 216,
-	.pmic_mode_map = pmic_mode_map_pmic4_smps,
-	.of_map_mode = rpmh_regulator_pmic4_smps_of_map_mode,
+static const struct qcom_cpufreq_soc_data rimps_soc_data = {
+	.reg_enable = 0x0,
+	.reg_domain_state = 0x20,
+	.reg_dcvs_ctrl = 0xb0,
+	.reg_freq_lut = 0x100,
+	.reg_volt_lut = 0x200,
+	.reg_intr_clr = 0x308,
+	.reg_perf_state = 0x320,
+	.reg_cycle_cntr = 0x3c4,
+	.lut_row_size = 4,
+	.lut_max_entries = 12,
+	.accumulative_counter = true,
+	.turbo_ind_support = false,
+	.perf_lock_support = false,
 };
 
-static const struct rpmh_vreg_hw_data pmic4_ftsmps426 = {
-	.regulator_type = VRM,
-	.ops = &rpmh_regulator_vrm_ops,
-	.voltage_range = REGULATOR_LINEAR_RANGE(300000, 0, 258, 4000),
-	.n_voltages = 259,
-	.pmic_mode_map = pmic_mode_map_pmic4_smps,
-	.of_map_mode = rpmh_regulator_pmic4_smps_of_map_mode,
+static const struct qcom_cpufreq_soc_data rimps_pdmem_soc_data = {
+	.reg_enable = 0x0,
+	.reg_domain_state = 0x20,
+	.reg_dcvs_ctrl = 0xb0,
+	.reg_freq_lut = 0x100,
+	.reg_volt_lut = 0x200,
+	.reg_intr_clr = 0x308,
+	.reg_perf_state = 0x320,
+	.reg_cycle_cntr = 0x3c4,
+	.lut_row_size = 4,
+	.lut_max_entries = 12,
+	.accumulative_counter = true,
+	.turbo_ind_support = false,
+	.perf_lock_support = true,
 };
 
-static const struct rpmh_vreg_hw_data pmic4_bob = {
-	.regulator_type = VRM,
-	.ops = &rpmh_regulator_vrm_bypass_ops,
-	.voltage_range = REGULATOR_LINEAR_RANGE(1824000, 0, 83, 32000),
-	.n_voltages = 84,
-	.pmic_mode_map = pmic_mode_map_pmic4_bob,
-	.of_map_mode = rpmh_regulator_pmic4_bob_of_map_mode,
-};
-
-static const struct rpmh_vreg_hw_data pmic4_lvs = {
-	.regulator_type = XOB,
-	.ops = &rpmh_regulator_xob_ops,
-	/* LVS hardware does not support voltage or mode configuration. */
-};
-
-static const struct rpmh_vreg_hw_data pmic5_pldo = {
-	.regulator_type = VRM,
-	.ops = &rpmh_regulator_vrm_drms_ops,
-	.voltage_range = REGULATOR_LINEAR_RANGE(1504000, 0, 255, 8000),
-	.n_voltages = 256,
-	.hpm_min_load_uA = 10000,
-	.pmic_mode_map = pmic_mode_map_pmic5_ldo,
-	.of_map_mode = rpmh_regulator_pmic4_ldo_of_map_mode,
-};
-
-static const struct rpmh_vreg_hw_data pmic5_pldo_lv = {
-	.regulator_type = VRM,
-	.ops = &rpmh_regulator_vrm_drms_ops,
-	.voltage_range = REGULATOR_LINEAR_RANGE(1504000, 0, 62, 8000),
-	.n_voltages = 63,
-	.hpm_min_load_uA = 10000,
-	.pmic_mode_map = pmic_mode_map_pmic5_ldo,
-	.of_map_mode = rpmh_regulator_pmic4_ldo_of_map_mode,
-};
-
-static const struct rpmh_vreg_hw_data pmic5_nldo = {
-	.regulator_type = VRM,
-	.ops = &rpmh_regulator_vrm_drms_ops,
-	.voltage_range = REGULATOR_LINEAR_RANGE(320000, 0, 123, 8000),
-	.n_voltages = 124,
-	.hpm_min_load_uA = 30000,
-	.pmic_mode_map = pmic_mode_map_pmic5_ldo,
-	.of_map_mode = rpmh_regulator_pmic4_ldo_of_map_mode,
-};
-
-static const struct rpmh_vreg_hw_data pmic5_hfsmps510 = {
-	.regulator_type = VRM,
-	.ops = &rpmh_regulator_vrm_ops,
-	.voltage_range = REGULATOR_LINEAR_RANGE(300000, 0, 215, 8000),
-	.n_voltages = 216,
-	.pmic_mode_map = pmic_mode_map_pmic5_smps,
-	.of_map_mode = rpmh_regulator_pmic4_smps_of_map_mode,
-};
-
-static const struct rpmh_vreg_hw_data pmic5_ftsmps510 = {
-	.regulator_type = VRM,
-	.ops = &rpmh_regulator_vrm_ops,
-	.voltage_range = REGULATOR_LINEAR_RANGE(270000, 0, 263, 4000),
-	.n_voltages = 264,
-	.pmic_mode_map = pmic_mode_map_pmic5_smps,
-	.of_map_mode = rpmh_regulator_pmic4_smps_of_map_mode,
-};
-
-static const struct rpmh_vreg_hw_data pmic5_ftsmps520 = {
-	.regulator_type = VRM,
-	.ops = &rpmh_regulator_vrm_ops,
-	.voltage_range = REGULATOR_LINEAR_RANGE(280000, 0, 263, 4000),
-	.n_voltages = 264,
-	.pmic_mode_map = pmic_mode_map_pmic5_smps,
-	.of_map_mode = rpmh_regulator_pmic4_smps_of_map_mode,
-};
-
-static const struct rpmh_vreg_hw_data pmic5_hfsmps515 = {
-	.regulator_type = VRM,
-	.ops = &rpmh_regulator_vrm_ops,
-	.voltage_range = REGULATOR_LINEAR_RANGE(320000, 0, 235, 16000),
-	.n_voltages = 236,
-	.pmic_mode_map = pmic_mode_map_pmic5_smps,
-	.of_map_mode = rpmh_regulator_pmic4_smps_of_map_mode,
-};
-
-static const struct rpmh_vreg_hw_data pmic5_hfsmps515_1 = {
-	.regulator_type = VRM,
-	.ops = &rpmh_regulator_vrm_ops,
-	.voltage_range = REGULATOR_LINEAR_RANGE(900000, 0, 4, 16000),
-	.n_voltages = 5,
-	.pmic_mode_map = pmic_mode_map_pmic5_smps,
-	.of_map_mode = rpmh_regulator_pmic4_smps_of_map_mode,
-};
-
-static const struct rpmh_vreg_hw_data pmic5_bob = {
-	.regulator_type = VRM,
-	.ops = &rpmh_regulator_vrm_bypass_ops,
-	.voltage_range = REGULATOR_LINEAR_RANGE(3000000, 0, 31, 32000),
-	.n_voltages = 32,
-	.pmic_mode_map = pmic_mode_map_pmic5_bob,
-	.of_map_mode = rpmh_regulator_pmic4_bob_of_map_mode,
-};
-
-#define RPMH_VREG(_name, _resource_name, _hw_data, _supply_name) \
-{ \
-	.name		= _name, \
-	.resource_name	= _resource_name, \
-	.hw_data	= _hw_data, \
-	.supply_name	= _supply_name, \
-}
-
-static const struct rpmh_vreg_init_data pm8998_vreg_data[] = {
-	RPMH_VREG("smps1",  "smp%s1",  &pmic4_ftsmps426, "vdd-s1"),
-	RPMH_VREG("smps2",  "smp%s2",  &pmic4_ftsmps426, "vdd-s2"),
-	RPMH_VREG("smps3",  "smp%s3",  &pmic4_hfsmps3,   "vdd-s3"),
-	RPMH_VREG("smps4",  "smp%s4",  &pmic4_hfsmps3,   "vdd-s4"),
-	RPMH_VREG("smps5",  "smp%s5",  &pmic4_hfsmps3,   "vdd-s5"),
-	RPMH_VREG("smps6",  "smp%s6",  &pmic4_ftsmps426, "vdd-s6"),
-	RPMH_VREG("smps7",  "smp%s7",  &pmic4_ftsmps426, "vdd-s7"),
-	RPMH_VREG("smps8",  "smp%s8",  &pmic4_ftsmps426, "vdd-s8"),
-	RPMH_VREG("smps9",  "smp%s9",  &pmic4_ftsmps426, "vdd-s9"),
-	RPMH_VREG("smps10", "smp%s10", &pmic4_ftsmps426, "vdd-s10"),
-	RPMH_VREG("smps11", "smp%s11", &pmic4_ftsmps426, "vdd-s11"),
-	RPMH_VREG("smps12", "smp%s12", &pmic4_ftsmps426, "vdd-s12"),
-	RPMH_VREG("smps13", "smp%s13", &pmic4_ftsmps426, "vdd-s13"),
-	RPMH_VREG("ldo1",   "ldo%s1",  &pmic4_nldo,      "vdd-l1-l27"),
-	RPMH_VREG("ldo2",   "ldo%s2",  &pmic4_nldo,      "vdd-l2-l8-l17"),
-	RPMH_VREG("ldo3",   "ldo%s3",  &pmic4_nldo,      "vdd-l3-l11"),
-	RPMH_VREG("ldo4",   "ldo%s4",  &pmic4_nldo,      "vdd-l4-l5"),
-	RPMH_VREG("ldo5",   "ldo%s5",  &pmic4_nldo,      "vdd-l4-l5"),
-	RPMH_VREG("ldo6",   "ldo%s6",  &pmic4_pldo,      "vdd-l6"),
-	RPMH_VREG("ldo7",   "ldo%s7",  &pmic4_pldo_lv,   "vdd-l7-l12-l14-l15"),
-	RPMH_VREG("ldo8",   "ldo%s8",  &pmic4_nldo,      "vdd-l2-l8-l17"),
-	RPMH_VREG("ldo9",   "ldo%s9",  &pmic4_pldo,      "vdd-l9"),
-	RPMH_VREG("ldo10",  "ldo%s10", &pmic4_pldo,      "vdd-l10-l23-l25"),
-	RPMH_VREG("ldo11",  "ldo%s11", &pmic4_nldo,      "vdd-l3-l11"),
-	RPMH_VREG("ldo12",  "ldo%s12", &pmic4_pldo_lv,   "vdd-l7-l12-l14-l15"),
-	RPMH_VREG("ldo13",  "ldo%s13", &pmic4_pldo,      "vdd-l13-l19-l21"),
-	RPMH_VREG("ldo14",  "ldo%s14", &pmic4_pldo_lv,   "vdd-l7-l12-l14-l15"),
-	RPMH_VREG("ldo15",  "ldo%s15", &pmic4_pldo_lv,   "vdd-l7-l12-l14-l15"),
-	RPMH_VREG("ldo16",  "ldo%s16", &pmic4_pldo,      "vdd-l16-l28"),
-	RPMH_VREG("ldo17",  "ldo%s17", &pmic4_nldo,      "vdd-l2-l8-l17"),
-	RPMH_VREG("ldo18",  "ldo%s18", &pmic4_pldo,      "vdd-l18-l22"),
-	RPMH_VREG("ldo19",  "ldo%s19", &pmic4_pldo,      "vdd-l13-l19-l21"),
-	RPMH_VREG("ldo20",  "ldo%s20", &pmic4_pldo,      "vdd-l20-l24"),
-	RPMH_VREG("ldo21",  "ldo%s21", &pmic4_pldo,      "vdd-l13-l19-l21"),
-	RPMH_VREG("ldo22",  "ldo%s22", &pmic4_pldo,      "vdd-l18-l22"),
-	RPMH_VREG("ldo23",  "ldo%s23", &pmic4_pldo,      "vdd-l10-l23-l25"),
-	RPMH_VREG("ldo24",  "ldo%s24", &pmic4_pldo,      "vdd-l20-l24"),
-	RPMH_VREG("ldo25",  "ldo%s25", &pmic4_pldo,      "vdd-l10-l23-l25"),
-	RPMH_VREG("ldo26",  "ldo%s26", &pmic4_nldo,      "vdd-l26"),
-	RPMH_VREG("ldo27",  "ldo%s27", &pmic4_nldo,      "vdd-l1-l27"),
-	RPMH_VREG("ldo28",  "ldo%s28", &pmic4_pldo,      "vdd-l16-l28"),
-	RPMH_VREG("lvs1",   "vs%s1",   &pmic4_lvs,       "vin-lvs-1-2"),
-	RPMH_VREG("lvs2",   "vs%s2",   &pmic4_lvs,       "vin-lvs-1-2"),
+static const struct of_device_id qcom_cpufreq_hw_match[] = {
+	{ .compatible = "qcom,cpufreq-hw", .data = &qcom_soc_data },
+	{ .compatible = "qcom,cpufreq-epss", .data = &epss_soc_data },
+	{ .compatible = "qcom,cpufreq-epss-pdmem", .data = &epss_pdmem_soc_data },
+	{ .compatible = "qcom,cpufreq-rimps", .data = &rimps_soc_data },
+	{ .compatible = "qcom,cpufreq-rimps-pdmem", .data = &rimps_pdmem_soc_data },
 	{}
 };
+MODULE_DEVICE_TABLE(of, qcom_cpufreq_hw_match);
 
-static const struct rpmh_vreg_init_data pmg1110_vreg_data[] = {
-	RPMH_VREG("smps1",  "smp%s1",  &pmic5_ftsmps510,  "vdd-s1"),
-	{}
-};
-
-static const struct rpmh_vreg_init_data pmi8998_vreg_data[] = {
-	RPMH_VREG("bob",    "bob%s1",  &pmic4_bob,       "vdd-bob"),
-	{}
-};
-
-static const struct rpmh_vreg_init_data pm8005_vreg_data[] = {
-	RPMH_VREG("smps1",  "smp%s1",  &pmic4_ftsmps426, "vdd-s1"),
-	RPMH_VREG("smps2",  "smp%s2",  &pmic4_ftsmps426, "vdd-s2"),
-	RPMH_VREG("smps3",  "smp%s3",  &pmic4_ftsmps426, "vdd-s3"),
-	RPMH_VREG("smps4",  "smp%s4",  &pmic4_ftsmps426, "vdd-s4"),
-	{}
-};
-
-static const struct rpmh_vreg_init_data pm8150_vreg_data[] = {
-	RPMH_VREG("smps1",  "smp%s1",  &pmic5_ftsmps510, "vdd-s1"),
-	RPMH_VREG("smps2",  "smp%s2",  &pmic5_ftsmps510, "vdd-s2"),
-	RPMH_VREG("smps3",  "smp%s3",  &pmic5_ftsmps510, "vdd-s3"),
-	RPMH_VREG("smps4",  "smp%s4",  &pmic5_hfsmps510,   "vdd-s4"),
-	RPMH_VREG("smps5",  "smp%s5",  &pmic5_hfsmps510,   "vdd-s5"),
-	RPMH_VREG("smps6",  "smp%s6",  &pmic5_ftsmps510, "vdd-s6"),
-	RPMH_VREG("smps7",  "smp%s7",  &pmic5_ftsmps510, "vdd-s7"),
-	RPMH_VREG("smps8",  "smp%s8",  &pmic5_ftsmps510, "vdd-s8"),
-	RPMH_VREG("smps9",  "smp%s9",  &pmic5_ftsmps510, "vdd-s9"),
-	RPMH_VREG("smps10", "smp%s10", &pmic5_ftsmps510, "vdd-s10"),
-	RPMH_VREG("ldo1",   "ldo%s1",  &pmic5_nldo,      "vdd-l1-l8-l11"),
-	RPMH_VREG("ldo2",   "ldo%s2",  &pmic5_pldo,      "vdd-l2-l10"),
-	RPMH_VREG("ldo3",   "ldo%s3",  &pmic5_nldo,      "vdd-l3-l4-l5-l18"),
-	RPMH_VREG("ldo4",   "ldo%s4",  &pmic5_nldo,      "vdd-l3-l4-l5-l18"),
-	RPMH_VREG("ldo5",   "ldo%s5",  &pmic5_nldo,      "vdd-l3-l4-l5-l18"),
-	RPMH_VREG("ldo6",   "ldo%s6",  &pmic5_nldo,      "vdd-l6-l9"),
-	RPMH_VREG("ldo7",   "ldo%s7",  &pmic5_pldo,      "vdd-l7-l12-l14-l15"),
-	RPMH_VREG("ldo8",   "ldo%s8",  &pmic5_nldo,      "vdd-l1-l8-l11"),
-	RPMH_VREG("ldo9",   "ldo%s9",  &pmic5_nldo,      "vdd-l6-l9"),
-	RPMH_VREG("ldo10",  "ldo%s10", &pmic5_pldo,      "vdd-l2-l10"),
-	RPMH_VREG("ldo11",  "ldo%s11", &pmic5_nldo,      "vdd-l1-l8-l11"),
-	RPMH_VREG("ldo12",  "ldo%s12", &pmic5_pldo_lv,   "vdd-l7-l12-l14-l15"),
-	RPMH_VREG("ldo13",  "ldo%s13", &pmic5_pldo,      "vdd-l13-l16-l17"),
-	RPMH_VREG("ldo14",  "ldo%s14", &pmic5_pldo_lv,   "vdd-l7-l12-l14-l15"),
-	RPMH_VREG("ldo15",  "ldo%s15", &pmic5_pldo_lv,   "vdd-l7-l12-l14-l15"),
-	RPMH_VREG("ldo16",  "ldo%s16", &pmic5_pldo,      "vdd-l13-l16-l17"),
-	RPMH_VREG("ldo17",  "ldo%s17", &pmic5_pldo,      "vdd-l13-l16-l17"),
-	RPMH_VREG("ldo18",  "ldo%s18", &pmic5_nldo,      "vdd-l3-l4-l5-l18"),
-	{}
-};
-
-static const struct rpmh_vreg_init_data pm8150l_vreg_data[] = {
-	RPMH_VREG("smps1",  "smp%s1",  &pmic5_ftsmps510, "vdd-s1"),
-	RPMH_VREG("smps2",  "smp%s2",  &pmic5_ftsmps510, "vdd-s2"),
-	RPMH_VREG("smps3",  "smp%s3",  &pmic5_ftsmps510, "vdd-s3"),
-	RPMH_VREG("smps4",  "smp%s4",  &pmic5_ftsmps510, "vdd-s4"),
-	RPMH_VREG("smps5",  "smp%s5",  &pmic5_ftsmps510, "vdd-s5"),
-	RPMH_VREG("smps6",  "smp%s6",  &pmic5_ftsmps510, "vdd-s6"),
-	RPMH_VREG("smps7",  "smp%s7",  &pmic5_ftsmps510, "vdd-s7"),
-	RPMH_VREG("smps8",  "smp%s8",  &pmic5_hfsmps510, "vdd-s8"),
-	RPMH_VREG("ldo1",   "ldo%s1",  &pmic5_pldo_lv,   "vdd-l1-l8"),
-	RPMH_VREG("ldo2",   "ldo%s2",  &pmic5_nldo,      "vdd-l2-l3"),
-	RPMH_VREG("ldo3",   "ldo%s3",  &pmic5_nldo,      "vdd-l2-l3"),
-	RPMH_VREG("ldo4",   "ldo%s4",  &pmic5_pldo,      "vdd-l4-l5-l6"),
-	RPMH_VREG("ldo5",   "ldo%s5",  &pmic5_pldo,      "vdd-l4-l5-l6"),
-	RPMH_VREG("ldo6",   "ldo%s6",  &pmic5_pldo,      "vdd-l4-l5-l6"),
-	RPMH_VREG("ldo7",   "ldo%s7",  &pmic5_pldo,      "vdd-l7-l11"),
-	RPMH_VREG("ldo8",   "ldo%s8",  &pmic5_pldo_lv,   "vdd-l1-l8"),
-	RPMH_VREG("ldo9",   "ldo%s9",  &pmic5_pldo,      "vdd-l9-l10"),
-	RPMH_VREG("ldo10",  "ldo%s10", &pmic5_pldo,      "vdd-l9-l10"),
-	RPMH_VREG("ldo11",  "ldo%s11", &pmic5_pldo,      "vdd-l7-l11"),
-	RPMH_VREG("bob",    "bob%s1",  &pmic5_bob,       "vdd-bob"),
-	{}
-};
-
-static const struct rpmh_vreg_init_data pmm8155au_vreg_data[] = {
-	RPMH_VREG("smps1",  "smp%s1",  &pmic5_ftsmps510, "vdd-s1"),
-	RPMH_VREG("smps2",  "smp%s2",  &pmic5_ftsmps510, "vdd-s2"),
-	RPMH_VREG("smps3",  "smp%s3",  &pmic5_ftsmps510, "vdd-s3"),
-	RPMH_VREG("smps4",  "smp%s4",  &pmic5_hfsmps510, "vdd-s4"),
-	RPMH_VREG("smps5",  "smp%s5",  &pmic5_hfsmps510, "vdd-s5"),
-	RPMH_VREG("smps6",  "smp%s6",  &pmic5_ftsmps510, "vdd-s6"),
-	RPMH_VREG("smps7",  "smp%s7",  &pmic5_ftsmps510, "vdd-s7"),
-	RPMH_VREG("smps8",  "smp%s8",  &pmic5_ftsmps510, "vdd-s8"),
-	RPMH_VREG("smps9",  "smp%s9",  &pmic5_ftsmps510, "vdd-s9"),
-	RPMH_VREG("smps10", "smp%s10", &pmic5_ftsmps510, "vdd-s10"),
-	RPMH_VREG("ldo1",   "ldo%s1",  &pmic5_nldo,      "vdd-l1-l8-l11"),
-	RPMH_VREG("ldo2",   "ldo%s2",  &pmic5_pldo,      "vdd-l2-l10"),
-	RPMH_VREG("ldo3",   "ldo%s3",  &pmic5_nldo,      "vdd-l3-l4-l5-l18"),
-	RPMH_VREG("ldo4",   "ldo%s4",  &pmic5_nldo,      "vdd-l3-l4-l5-l18"),
-	RPMH_VREG("ldo5",   "ldo%s5",  &pmic5_nldo,      "vdd-l3-l4-l5-l18"),
-	RPMH_VREG("ldo6",   "ldo%s6",  &pmic5_nldo,      "vdd-l6-l9"),
-	RPMH_VREG("ldo7",   "ldo%s7",  &pmic5_pldo_lv,   "vdd-l7-l12-l14-l15"),
-	RPMH_VREG("ldo8",   "ldo%s8",  &pmic5_nldo,      "vdd-l1-l8-l11"),
-	RPMH_VREG("ldo9",   "ldo%s9",  &pmic5_nldo,      "vdd-l6-l9"),
-	RPMH_VREG("ldo10",  "ldo%s10", &pmic5_pldo,      "vdd-l2-l10"),
-	RPMH_VREG("ldo11",  "ldo%s11", &pmic5_nldo,      "vdd-l1-l8-l11"),
-	RPMH_VREG("ldo12",  "ldo%s12", &pmic5_pldo_lv,   "vdd-l7-l12-l14-l15"),
-	RPMH_VREG("ldo13",  "ldo%s13", &pmic5_pldo,      "vdd-l13-l16-l17"),
-	RPMH_VREG("ldo14",  "ldo%s14", &pmic5_pldo_lv,   "vdd-l7-l12-l14-l15"),
-	RPMH_VREG("ldo15",  "ldo%s15", &pmic5_pldo_lv,   "vdd-l7-l12-l14-l15"),
-	RPMH_VREG("ldo16",  "ldo%s16", &pmic5_pldo,      "vdd-l13-l16-l17"),
-	RPMH_VREG("ldo17",  "ldo%s17", &pmic5_pldo,      "vdd-l13-l16-l17"),
-	RPMH_VREG("ldo18",  "ldo%s18", &pmic5_nldo,      "vdd-l3-l4-l5-l18"),
-	{}
-};
-
-static const struct rpmh_vreg_init_data pm8350_vreg_data[] = {
-	RPMH_VREG("smps1",  "smp%s1",  &pmic5_ftsmps510, "vdd-s1"),
-	RPMH_VREG("smps2",  "smp%s2",  &pmic5_ftsmps510, "vdd-s2"),
-	RPMH_VREG("smps3",  "smp%s3",  &pmic5_ftsmps510, "vdd-s3"),
-	RPMH_VREG("smps4",  "smp%s4",  &pmic5_ftsmps510, "vdd-s4"),
-	RPMH_VREG("smps5",  "smp%s5",  &pmic5_ftsmps510, "vdd-s5"),
-	RPMH_VREG("smps6",  "smp%s6",  &pmic5_ftsmps510, "vdd-s6"),
-	RPMH_VREG("smps7",  "smp%s7",  &pmic5_ftsmps510, "vdd-s7"),
-	RPMH_VREG("smps8",  "smp%s8",  &pmic5_ftsmps510, "vdd-s8"),
-	RPMH_VREG("smps9",  "smp%s9",  &pmic5_ftsmps510, "vdd-s9"),
-	RPMH_VREG("smps10", "smp%s10", &pmic5_hfsmps510, "vdd-s10"),
-	RPMH_VREG("smps11", "smp%s11", &pmic5_hfsmps510, "vdd-s11"),
-	RPMH_VREG("smps12", "smp%s12", &pmic5_hfsmps510, "vdd-s12"),
-	RPMH_VREG("ldo1",   "ldo%s1",  &pmic5_nldo,      "vdd-l1-l4"),
-	RPMH_VREG("ldo2",   "ldo%s2",  &pmic5_pldo,      "vdd-l2-l7"),
-	RPMH_VREG("ldo3",   "ldo%s3",  &pmic5_nldo,      "vdd-l3-l5"),
-	RPMH_VREG("ldo4",   "ldo%s4",  &pmic5_nldo,      "vdd-l1-l4"),
-	RPMH_VREG("ldo5",   "ldo%s5",  &pmic5_nldo,      "vdd-l3-l5"),
-	RPMH_VREG("ldo6",   "ldo%s6",  &pmic5_nldo,      "vdd-l6-l9-l10"),
-	RPMH_VREG("ldo7",   "ldo%s7",  &pmic5_pldo,      "vdd-l2-l7"),
-	RPMH_VREG("ldo8",   "ldo%s8",  &pmic5_nldo,      "vdd-l8"),
-	RPMH_VREG("ldo9",   "ldo%s9",  &pmic5_nldo,      "vdd-l6-l9-l10"),
-	RPMH_VREG("ldo10",  "ldo%s10", &pmic5_nldo,      "vdd-l6-l9-l10"),
-	{}
-};
-
-static const struct rpmh_vreg_init_data pm8350c_vreg_data[] = {
-	RPMH_VREG("smps1",  "smp%s1",  &pmic5_hfsmps515, "vdd-s1"),
-	RPMH_VREG("smps2",  "smp%s2",  &pmic5_ftsmps510, "vdd-s2"),
-	RPMH_VREG("smps3",  "smp%s3",  &pmic5_ftsmps510, "vdd-s3"),
-	RPMH_VREG("smps4",  "smp%s4",  &pmic5_ftsmps510, "vdd-s4"),
-	RPMH_VREG("smps5",  "smp%s5",  &pmic5_ftsmps510, "vdd-s5"),
-	RPMH_VREG("smps6",  "smp%s6",  &pmic5_ftsmps510, "vdd-s6"),
-	RPMH_VREG("smps7",  "smp%s7",  &pmic5_ftsmps510, "vdd-s7"),
-	RPMH_VREG("smps8",  "smp%s8",  &pmic5_ftsmps510, "vdd-s8"),
-	RPMH_VREG("smps9",  "smp%s9",  &pmic5_ftsmps510, "vdd-s9"),
-	RPMH_VREG("smps10", "smp%s10", &pmic5_ftsmps510, "vdd-s10"),
-	RPMH_VREG("ldo1",   "ldo%s1",  &pmic5_pldo_lv,   "vdd-l1-l12"),
-	RPMH_VREG("ldo2",   "ldo%s2",  &pmic5_pldo_lv,   "vdd-l2-l8"),
-	RPMH_VREG("ldo3",   "ldo%s3",  &pmic5_pldo,      "vdd-l3-l4-l5-l7-l13"),
-	RPMH_VREG("ldo4",   "ldo%s4",  &pmic5_pldo,      "vdd-l3-l4-l5-l7-l13"),
-	RPMH_VREG("ldo5",   "ldo%s5",  &pmic5_pldo,      "vdd-l3-l4-l5-l7-l13"),
-	RPMH_VREG("ldo6",   "ldo%s6",  &pmic5_pldo,      "vdd-l6-l9-l11"),
-	RPMH_VREG("ldo7",   "ldo%s7",  &pmic5_pldo,      "vdd-l3-l4-l5-l7-l13"),
-	RPMH_VREG("ldo8",   "ldo%s8",  &pmic5_pldo_lv,   "vdd-l2-l8"),
-	RPMH_VREG("ldo9",   "ldo%s9",  &pmic5_pldo,      "vdd-l6-l9-l11"),
-	RPMH_VREG("ldo10",  "ldo%s10", &pmic5_nldo,      "vdd-l10"),
-	RPMH_VREG("ldo11",  "ldo%s11", &pmic5_pldo,      "vdd-l6-l9-l11"),
-	RPMH_VREG("ldo12",  "ldo%s12", &pmic5_pldo_lv,   "vdd-l1-l12"),
-	RPMH_VREG("ldo13",  "ldo%s13", &pmic5_pldo,      "vdd-l3-l4-l5-l7-l13"),
-	RPMH_VREG("bob",    "bob%s1",  &pmic5_bob,       "vdd-bob"),
-	{}
-};
-
-static const struct rpmh_vreg_init_data pm8450_vreg_data[] = {
-	RPMH_VREG("smps1",  "smp%s1",  &pmic5_ftsmps520, "vdd-s1"),
-	RPMH_VREG("smps2",  "smp%s2",  &pmic5_ftsmps520, "vdd-s2"),
-	RPMH_VREG("smps3",  "smp%s3",  &pmic5_ftsmps520, "vdd-s3"),
-	RPMH_VREG("smps4",  "smp%s4",  &pmic5_ftsmps520, "vdd-s4"),
-	RPMH_VREG("smps5",  "smp%s5",  &pmic5_ftsmps520, "vdd-s5"),
-	RPMH_VREG("smps6",  "smp%s6",  &pmic5_ftsmps520, "vdd-s6"),
-	RPMH_VREG("ldo1",   "ldo%s1",  &pmic5_nldo,      "vdd-l1"),
-	RPMH_VREG("ldo2",   "ldo%s2",  &pmic5_nldo,      "vdd-l2"),
-	RPMH_VREG("ldo3",   "ldo%s3",  &pmic5_nldo,      "vdd-l3"),
-	RPMH_VREG("ldo4",   "ldo%s4",  &pmic5_pldo_lv,   "vdd-l4"),
-	{}
-};
-
-static const struct rpmh_vreg_init_data pm8009_vreg_data[] = {
-	RPMH_VREG("smps1",  "smp%s1",  &pmic5_hfsmps510, "vdd-s1"),
-	RPMH_VREG("smps2",  "smp%s2",  &pmic5_hfsmps515, "vdd-s2"),
-	RPMH_VREG("ldo1",   "ldo%s1",  &pmic5_nldo,      "vdd-l1"),
-	RPMH_VREG("ldo2",   "ldo%s2",  &pmic5_nldo,      "vdd-l2"),
-	RPMH_VREG("ldo3",   "ldo%s3",  &pmic5_nldo,      "vdd-l3"),
-	RPMH_VREG("ldo4",   "ldo%s4",  &pmic5_nldo,      "vdd-l4"),
-	RPMH_VREG("ldo5",   "ldo%s5",  &pmic5_pldo,      "vdd-l5-l6"),
-	RPMH_VREG("ldo6",   "ldo%s6",  &pmic5_pldo,      "vdd-l5-l6"),
-	RPMH_VREG("ldo7",   "ldo%s7",  &pmic5_pldo_lv,   "vdd-l7"),
-	{}
-};
-
-static const struct rpmh_vreg_init_data pm8009_1_vreg_data[] = {
-	RPMH_VREG("smps1",  "smp%s1",  &pmic5_hfsmps510, "vdd-s1"),
-	RPMH_VREG("smps2",  "smp%s2",  &pmic5_hfsmps515_1, "vdd-s2"),
-	RPMH_VREG("ldo1",   "ldo%s1",  &pmic5_nldo,      "vdd-l1"),
-	RPMH_VREG("ldo2",   "ldo%s2",  &pmic5_nldo,      "vdd-l2"),
-	RPMH_VREG("ldo3",   "ldo%s3",  &pmic5_nldo,      "vdd-l3"),
-	RPMH_VREG("ldo4",   "ldo%s4",  &pmic5_nldo,      "vdd-l4"),
-	RPMH_VREG("ldo5",   "ldo%s5",  &pmic5_pldo,      "vdd-l5-l6"),
-	RPMH_VREG("ldo6",   "ldo%s6",  &pmic5_pldo,      "vdd-l5-l6"),
-	RPMH_VREG("ldo7",   "ldo%s7",  &pmic5_pldo_lv,   "vdd-l7"),
-	{}
-};
-
-static const struct rpmh_vreg_init_data pm6150_vreg_data[] = {
-	RPMH_VREG("smps1",  "smp%s1",  &pmic5_ftsmps510, "vdd-s1"),
-	RPMH_VREG("smps2",  "smp%s2",  &pmic5_ftsmps510, "vdd-s2"),
-	RPMH_VREG("smps3",  "smp%s3",  &pmic5_ftsmps510, "vdd-s3"),
-	RPMH_VREG("smps4",  "smp%s4",  &pmic5_hfsmps510, "vdd-s4"),
-	RPMH_VREG("smps5",  "smp%s5",  &pmic5_hfsmps510, "vdd-s5"),
-	RPMH_VREG("ldo1",   "ldo%s1",  &pmic5_nldo,      "vdd-l1"),
-	RPMH_VREG("ldo2",   "ldo%s2",  &pmic5_nldo,      "vdd-l2-l3"),
-	RPMH_VREG("ldo3",   "ldo%s3",  &pmic5_nldo,      "vdd-l2-l3"),
-	RPMH_VREG("ldo4",   "ldo%s4",  &pmic5_nldo,      "vdd-l4-l7-l8"),
-	RPMH_VREG("ldo5",   "ldo%s5",  &pmic5_pldo,   "vdd-l5-l16-l17-l18-l19"),
-	RPMH_VREG("ldo6",   "ldo%s6",  &pmic5_nldo,      "vdd-l6"),
-	RPMH_VREG("ldo7",   "ldo%s7",  &pmic5_nldo,      "vdd-l4-l7-l8"),
-	RPMH_VREG("ldo8",   "ldo%s8",  &pmic5_nldo,      "vdd-l4-l7-l8"),
-	RPMH_VREG("ldo9",   "ldo%s9",  &pmic5_nldo,      "vdd-l9"),
-	RPMH_VREG("ldo10",  "ldo%s10", &pmic5_pldo_lv,   "vdd-l10-l14-l15"),
-	RPMH_VREG("ldo11",  "ldo%s11", &pmic5_pldo_lv,   "vdd-l11-l12-l13"),
-	RPMH_VREG("ldo12",  "ldo%s12", &pmic5_pldo_lv,   "vdd-l11-l12-l13"),
-	RPMH_VREG("ldo13",  "ldo%s13", &pmic5_pldo_lv,   "vdd-l11-l12-l13"),
-	RPMH_VREG("ldo14",  "ldo%s14", &pmic5_pldo_lv,   "vdd-l10-l14-l15"),
-	RPMH_VREG("ldo15",  "ldo%s15", &pmic5_pldo_lv,   "vdd-l10-l14-l15"),
-	RPMH_VREG("ldo16",  "ldo%s16", &pmic5_pldo,   "vdd-l5-l16-l17-l18-l19"),
-	RPMH_VREG("ldo17",  "ldo%s17", &pmic5_pldo,   "vdd-l5-l16-l17-l18-l19"),
-	RPMH_VREG("ldo18",  "ldo%s18", &pmic5_pldo,   "vdd-l5-l16-l17-l18-l19"),
-	RPMH_VREG("ldo19",  "ldo%s19", &pmic5_pldo,   "vdd-l5-l16-l17-l18-l19"),
-	{}
-};
-
-static const struct rpmh_vreg_init_data pm6150l_vreg_data[] = {
-	RPMH_VREG("smps1",  "smp%s1",  &pmic5_ftsmps510, "vdd-s1"),
-	RPMH_VREG("smps2",  "smp%s2",  &pmic5_ftsmps510, "vdd-s2"),
-	RPMH_VREG("smps3",  "smp%s3",  &pmic5_ftsmps510, "vdd-s3"),
-	RPMH_VREG("smps4",  "smp%s4",  &pmic5_ftsmps510, "vdd-s4"),
-	RPMH_VREG("smps5",  "smp%s5",  &pmic5_ftsmps510, "vdd-s5"),
-	RPMH_VREG("smps6",  "smp%s6",  &pmic5_ftsmps510, "vdd-s6"),
-	RPMH_VREG("smps7",  "smp%s7",  &pmic5_ftsmps510, "vdd-s7"),
-	RPMH_VREG("smps8",  "smp%s8",  &pmic5_hfsmps510, "vdd-s8"),
-	RPMH_VREG("ldo1",   "ldo%s1",  &pmic5_pldo_lv,   "vdd-l1-l8"),
-	RPMH_VREG("ldo2",   "ldo%s2",  &pmic5_nldo,      "vdd-l2-l3"),
-	RPMH_VREG("ldo3",   "ldo%s3",  &pmic5_nldo,      "vdd-l2-l3"),
-	RPMH_VREG("ldo4",   "ldo%s4",  &pmic5_pldo,      "vdd-l4-l5-l6"),
-	RPMH_VREG("ldo5",   "ldo%s5",  &pmic5_pldo,      "vdd-l4-l5-l6"),
-	RPMH_VREG("ldo6",   "ldo%s6",  &pmic5_pldo,      "vdd-l4-l5-l6"),
-	RPMH_VREG("ldo7",   "ldo%s7",  &pmic5_pldo,      "vdd-l7-l11"),
-	RPMH_VREG("ldo8",   "ldo%s8",  &pmic5_pldo,      "vdd-l1-l8"),
-	RPMH_VREG("ldo9",   "ldo%s9",  &pmic5_pldo,      "vdd-l9-l10"),
-	RPMH_VREG("ldo10",  "ldo%s10", &pmic5_pldo,      "vdd-l9-l10"),
-	RPMH_VREG("ldo11",  "ldo%s11", &pmic5_pldo,      "vdd-l7-l11"),
-	RPMH_VREG("bob",    "bob%s1",  &pmic5_bob,       "vdd-bob"),
-	{}
-};
-
-static const struct rpmh_vreg_init_data pm6350_vreg_data[] = {
-	RPMH_VREG("smps1",  "smp%s1",  &pmic5_ftsmps510, NULL),
-	RPMH_VREG("smps2",  "smp%s2",  &pmic5_hfsmps510, NULL),
-	/* smps3 - smps5 not configured */
-	RPMH_VREG("ldo1",   "ldo%s1",  &pmic5_nldo,      NULL),
-	RPMH_VREG("ldo2",   "ldo%s2",  &pmic5_pldo,      NULL),
-	RPMH_VREG("ldo3",   "ldo%s3",  &pmic5_pldo,      NULL),
-	RPMH_VREG("ldo4",   "ldo%s4",  &pmic5_nldo,      NULL),
-	RPMH_VREG("ldo5",   "ldo%s5",  &pmic5_pldo,      NULL),
-	RPMH_VREG("ldo6",   "ldo%s6",  &pmic5_pldo,      NULL),
-	RPMH_VREG("ldo7",   "ldo%s7",  &pmic5_pldo,      NULL),
-	RPMH_VREG("ldo8",   "ldo%s8",  &pmic5_pldo,      NULL),
-	RPMH_VREG("ldo9",   "ldo%s9",  &pmic5_pldo,      NULL),
-	RPMH_VREG("ldo10",  "ldo%s10", &pmic5_pldo,      NULL),
-	RPMH_VREG("ldo11",  "ldo%s11", &pmic5_pldo,      NULL),
-	RPMH_VREG("ldo12",  "ldo%s12", &pmic5_pldo,      NULL),
-	RPMH_VREG("ldo13",  "ldo%s13", &pmic5_nldo,      NULL),
-	RPMH_VREG("ldo14",  "ldo%s14", &pmic5_pldo,      NULL),
-	RPMH_VREG("ldo15",  "ldo%s15", &pmic5_nldo,      NULL),
-	RPMH_VREG("ldo16",  "ldo%s16", &pmic5_nldo,      NULL),
-	/* ldo17 not configured */
-	RPMH_VREG("ldo18",  "ldo%s18", &pmic5_nldo,      NULL),
-	RPMH_VREG("ldo19",  "ldo%s19", &pmic5_nldo,      NULL),
-	RPMH_VREG("ldo20",  "ldo%s20", &pmic5_nldo,      NULL),
-	RPMH_VREG("ldo21",  "ldo%s21", &pmic5_nldo,      NULL),
-	RPMH_VREG("ldo22",  "ldo%s22", &pmic5_nldo,      NULL),
-};
-
-static const struct rpmh_vreg_init_data pmx55_vreg_data[] = {
-	RPMH_VREG("smps1",   "smp%s1",    &pmic5_ftsmps510, "vdd-s1"),
-	RPMH_VREG("smps2",   "smp%s2",    &pmic5_hfsmps510, "vdd-s2"),
-	RPMH_VREG("smps3",   "smp%s3",    &pmic5_hfsmps510, "vdd-s3"),
-	RPMH_VREG("smps4",   "smp%s4",    &pmic5_hfsmps510, "vdd-s4"),
-	RPMH_VREG("smps5",   "smp%s5",    &pmic5_hfsmps510, "vdd-s5"),
-	RPMH_VREG("smps6",   "smp%s6",    &pmic5_ftsmps510, "vdd-s6"),
-	RPMH_VREG("smps7",   "smp%s7",    &pmic5_hfsmps510, "vdd-s7"),
-	RPMH_VREG("ldo1",    "ldo%s1",    &pmic5_nldo,      "vdd-l1-l2"),
-	RPMH_VREG("ldo2",    "ldo%s2",    &pmic5_nldo,      "vdd-l1-l2"),
-	RPMH_VREG("ldo3",    "ldo%s3",    &pmic5_nldo,      "vdd-l3-l9"),
-	RPMH_VREG("ldo4",    "ldo%s4",    &pmic5_nldo,      "vdd-l4-l12"),
-	RPMH_VREG("ldo5",    "ldo%s5",    &pmic5_pldo,      "vdd-l5-l6"),
-	RPMH_VREG("ldo6",    "ldo%s6",    &pmic5_pldo,      "vdd-l5-l6"),
-	RPMH_VREG("ldo7",    "ldo%s7",    &pmic5_nldo,      "vdd-l7-l8"),
-	RPMH_VREG("ldo8",    "ldo%s8",    &pmic5_nldo,      "vdd-l7-l8"),
-	RPMH_VREG("ldo9",    "ldo%s9",    &pmic5_nldo,      "vdd-l3-l9"),
-	RPMH_VREG("ldo10",   "ldo%s10",   &pmic5_pldo,      "vdd-l10-l11-l13"),
-	RPMH_VREG("ldo11",   "ldo%s11",   &pmic5_pldo,      "vdd-l10-l11-l13"),
-	RPMH_VREG("ldo12",   "ldo%s12",   &pmic5_nldo,      "vdd-l4-l12"),
-	RPMH_VREG("ldo13",   "ldo%s13",   &pmic5_pldo,      "vdd-l10-l11-l13"),
-	RPMH_VREG("ldo14",   "ldo%s14",   &pmic5_nldo,      "vdd-l14"),
-	RPMH_VREG("ldo15",   "ldo%s15",   &pmic5_nldo,      "vdd-l15"),
-	RPMH_VREG("ldo16",   "ldo%s16",   &pmic5_pldo,      "vdd-l16"),
-	{}
-};
-
-static const struct rpmh_vreg_init_data pmx65_vreg_data[] = {
-	RPMH_VREG("smps1",   "smp%s1",    &pmic5_ftsmps510, "vdd-s1"),
-	RPMH_VREG("smps2",   "smp%s2",    &pmic5_hfsmps510, "vdd-s2"),
-	RPMH_VREG("smps3",   "smp%s3",    &pmic5_hfsmps510, "vdd-s3"),
-	RPMH_VREG("smps4",   "smp%s4",    &pmic5_hfsmps510, "vdd-s4"),
-	RPMH_VREG("smps5",   "smp%s5",    &pmic5_hfsmps510, "vdd-s5"),
-	RPMH_VREG("smps6",   "smp%s6",    &pmic5_ftsmps510, "vdd-s6"),
-	RPMH_VREG("smps7",   "smp%s7",    &pmic5_hfsmps510, "vdd-s7"),
-	RPMH_VREG("smps8",   "smp%s8",    &pmic5_hfsmps510, "vdd-s8"),
-	RPMH_VREG("ldo1",    "ldo%s1",    &pmic5_nldo,      "vdd-l1"),
-	RPMH_VREG("ldo2",    "ldo%s2",    &pmic5_nldo,      "vdd-l2-l18"),
-	RPMH_VREG("ldo3",    "ldo%s3",    &pmic5_nldo,      "vdd-l3"),
-	RPMH_VREG("ldo4",    "ldo%s4",    &pmic5_nldo,      "vdd-l4"),
-	RPMH_VREG("ldo5",    "ldo%s5",    &pmic5_pldo,      "vdd-l5-l6-l16"),
-	RPMH_VREG("ldo6",    "ldo%s6",    &pmic5_pldo,      "vdd-l5-l6-l16"),
-	RPMH_VREG("ldo7",    "ldo%s7",    &pmic5_nldo,      "vdd-l7"),
-	RPMH_VREG("ldo8",    "ldo%s8",    &pmic5_nldo,      "vdd-l8-l9"),
-	RPMH_VREG("ldo9",    "ldo%s9",    &pmic5_nldo,      "vdd-l8-l9"),
-	RPMH_VREG("ldo10",   "ldo%s10",   &pmic5_pldo,      "vdd-l10"),
-	RPMH_VREG("ldo11",   "ldo%s11",   &pmic5_pldo,      "vdd-l11-l13"),
-	RPMH_VREG("ldo12",   "ldo%s12",   &pmic5_nldo,      "vdd-l12"),
-	RPMH_VREG("ldo13",   "ldo%s13",   &pmic5_pldo,      "vdd-l11-l13"),
-	RPMH_VREG("ldo14",   "ldo%s14",   &pmic5_nldo,      "vdd-l14"),
-	RPMH_VREG("ldo15",   "ldo%s15",   &pmic5_nldo,      "vdd-l15"),
-	RPMH_VREG("ldo16",   "ldo%s16",   &pmic5_pldo,      "vdd-l5-l6-l16"),
-	RPMH_VREG("ldo17",   "ldo%s17",   &pmic5_nldo,      "vdd-l17"),
-	/* ldo18 not configured */
-	RPMH_VREG("ldo19",   "ldo%s19",   &pmic5_nldo,      "vdd-l19"),
-	RPMH_VREG("ldo20",   "ldo%s20",   &pmic5_nldo,      "vdd-l20"),
-	RPMH_VREG("ldo21",   "ldo%s21",   &pmic5_nldo,      "vdd-l21"),
-	{}
-};
-
-static const struct rpmh_vreg_init_data pm7325_vreg_data[] = {
-	RPMH_VREG("smps1",  "smp%s1",  &pmic5_hfsmps510, "vdd-s1"),
-	RPMH_VREG("smps2",  "smp%s2",  &pmic5_ftsmps520, "vdd-s2"),
-	RPMH_VREG("smps3",  "smp%s3",  &pmic5_ftsmps520, "vdd-s3"),
-	RPMH_VREG("smps4",  "smp%s4",  &pmic5_ftsmps520, "vdd-s4"),
-	RPMH_VREG("smps5",  "smp%s5",  &pmic5_ftsmps520, "vdd-s5"),
-	RPMH_VREG("smps6",  "smp%s6",  &pmic5_ftsmps520, "vdd-s6"),
-	RPMH_VREG("smps7",  "smp%s7",  &pmic5_ftsmps520, "vdd-s7"),
-	RPMH_VREG("smps8",  "smp%s8",  &pmic5_hfsmps510, "vdd-s8"),
-	RPMH_VREG("ldo1",   "ldo%s1",  &pmic5_nldo,      "vdd-l1-l4-l12-l15"),
-	RPMH_VREG("ldo2",   "ldo%s2",  &pmic5_pldo,      "vdd-l2-l7"),
-	RPMH_VREG("ldo3",   "ldo%s3",  &pmic5_nldo,      "vdd-l3"),
-	RPMH_VREG("ldo4",   "ldo%s4",  &pmic5_nldo,      "vdd-l1-l4-l12-l15"),
-	RPMH_VREG("ldo5",   "ldo%s5",  &pmic5_nldo,      "vdd-l5"),
-	RPMH_VREG("ldo6",   "ldo%s6",  &pmic5_nldo,      "vdd-l6-l9-l10"),
-	RPMH_VREG("ldo7",   "ldo%s7",  &pmic5_pldo,      "vdd-l2-l7"),
-	RPMH_VREG("ldo8",   "ldo%s8",  &pmic5_nldo,      "vdd-l8"),
-	RPMH_VREG("ldo9",   "ldo%s9",  &pmic5_nldo,      "vdd-l6-l9-l10"),
-	RPMH_VREG("ldo10",  "ldo%s10", &pmic5_nldo,      "vdd-l6-l9-l10"),
-	RPMH_VREG("ldo11",  "ldo%s11", &pmic5_pldo_lv,   "vdd-l11-l17-l18-l19"),
-	RPMH_VREG("ldo12",  "ldo%s12", &pmic5_nldo,      "vdd-l1-l4-l12-l15"),
-	RPMH_VREG("ldo13",  "ldo%s13", &pmic5_nldo,      "vdd-l13"),
-	RPMH_VREG("ldo14",  "ldo%s14", &pmic5_nldo,      "vdd-l14-l16"),
-	RPMH_VREG("ldo15",  "ldo%s15", &pmic5_nldo,      "vdd-l1-l4-l12-l15"),
-	RPMH_VREG("ldo16",  "ldo%s16", &pmic5_nldo,      "vdd-l14-l16"),
-	RPMH_VREG("ldo17",  "ldo%s17", &pmic5_pldo_lv,   "vdd-l11-l17-l18-l19"),
-	RPMH_VREG("ldo18",  "ldo%s18", &pmic5_pldo_lv,   "vdd-l11-l17-l18-l19"),
-	RPMH_VREG("ldo19",  "ldo%s19", &pmic5_pldo_lv,   "vdd-l11-l17-l18-l19"),
-	{}
-};
-
-static const struct rpmh_vreg_init_data pmr735a_vreg_data[] = {
-	RPMH_VREG("smps1",  "smp%s1",  &pmic5_ftsmps520, "vdd-s1"),
-	RPMH_VREG("smps2",  "smp%s2",  &pmic5_ftsmps520, "vdd-s2"),
-	RPMH_VREG("smps3",  "smp%s3",  &pmic5_hfsmps515, "vdd-s3"),
-	RPMH_VREG("ldo1",   "ldo%s1",  &pmic5_nldo,      "vdd-l1-l2"),
-	RPMH_VREG("ldo2",   "ldo%s2",  &pmic5_nldo,      "vdd-l1-l2"),
-	RPMH_VREG("ldo3",   "ldo%s3",  &pmic5_nldo,      "vdd-l3"),
-	RPMH_VREG("ldo4",   "ldo%s4",  &pmic5_pldo_lv,   "vdd-l4"),
-	RPMH_VREG("ldo5",   "ldo%s5",  &pmic5_nldo,      "vdd-l5-l6"),
-	RPMH_VREG("ldo6",   "ldo%s6",  &pmic5_nldo,      "vdd-l5-l6"),
-	RPMH_VREG("ldo7",   "ldo%s7",  &pmic5_pldo,      "vdd-l7-bob"),
-	{}
-};
-
-static const struct rpmh_vreg_init_data pm660_vreg_data[] = {
-	RPMH_VREG("smps1",  "smp%s1",  &pmic4_ftsmps426, "vdd-s1"),
-	RPMH_VREG("smps2",  "smp%s2",  &pmic4_ftsmps426, "vdd-s2"),
-	RPMH_VREG("smps3",  "smp%s3",  &pmic4_ftsmps426, "vdd-s3"),
-	RPMH_VREG("smps4",  "smp%s4",  &pmic4_hfsmps3,   "vdd-s4"),
-	RPMH_VREG("smps5",  "smp%s5",  &pmic4_hfsmps3,   "vdd-s5"),
-	RPMH_VREG("smps6",  "smp%s6",  &pmic4_hfsmps3,   "vdd-s6"),
-	RPMH_VREG("ldo1",   "ldo%s1",  &pmic4_nldo,      "vdd-l1-l6-l7"),
-	RPMH_VREG("ldo2",   "ldo%s2",  &pmic4_nldo,      "vdd-l2-l3"),
-	RPMH_VREG("ldo3",   "ldo%s3",  &pmic4_nldo,      "vdd-l2-l3"),
-	/* ldo4 is inaccessible on PM660 */
-	RPMH_VREG("ldo5",   "ldo%s5",  &pmic4_nldo,      "vdd-l5"),
-	RPMH_VREG("ldo6",   "ldo%s6",  &pmic4_nldo,      "vdd-l1-l6-l7"),
-	RPMH_VREG("ldo7",   "ldo%s7",  &pmic4_nldo,      "vdd-l1-l6-l7"),
-	RPMH_VREG("ldo8",   "ldo%s8",  &pmic4_pldo_lv,   "vdd-l8-l9-l10-l11-l12-l13-l14"),
-	RPMH_VREG("ldo9",   "ldo%s9",  &pmic4_pldo_lv,   "vdd-l8-l9-l10-l11-l12-l13-l14"),
-	RPMH_VREG("ldo10",  "ldo%s10", &pmic4_pldo_lv,   "vdd-l8-l9-l10-l11-l12-l13-l14"),
-	RPMH_VREG("ldo11",  "ldo%s11", &pmic4_pldo_lv,   "vdd-l8-l9-l10-l11-l12-l13-l14"),
-	RPMH_VREG("ldo12",  "ldo%s12", &pmic4_pldo_lv,   "vdd-l8-l9-l10-l11-l12-l13-l14"),
-	RPMH_VREG("ldo13",  "ldo%s13", &pmic4_pldo_lv,   "vdd-l8-l9-l10-l11-l12-l13-l14"),
-	RPMH_VREG("ldo14",  "ldo%s14", &pmic4_pldo_lv,   "vdd-l8-l9-l10-l11-l12-l13-l14"),
-	RPMH_VREG("ldo15",  "ldo%s15", &pmic4_pldo,      "vdd-l15-l16-l17-l18-l19"),
-	RPMH_VREG("ldo16",  "ldo%s16", &pmic4_pldo,      "vdd-l15-l16-l17-l18-l19"),
-	RPMH_VREG("ldo17",  "ldo%s17", &pmic4_pldo,      "vdd-l15-l16-l17-l18-l19"),
-	RPMH_VREG("ldo18",  "ldo%s18", &pmic4_pldo,      "vdd-l15-l16-l17-l18-l19"),
-	RPMH_VREG("ldo19",  "ldo%s19", &pmic4_pldo,      "vdd-l15-l16-l17-l18-l19"),
-	{}
-};
-
-static const struct rpmh_vreg_init_data pm660l_vreg_data[] = {
-	RPMH_VREG("smps1",  "smp%s1",  &pmic4_ftsmps426, "vdd-s1"),
-	RPMH_VREG("smps2",  "smp%s2",  &pmic4_ftsmps426, "vdd-s2"),
-	RPMH_VREG("smps3",  "smp%s3",  &pmic4_ftsmps426, "vdd-s3-s4"),
-	RPMH_VREG("smps5",  "smp%s5",  &pmic4_ftsmps426, "vdd-s5"),
-	RPMH_VREG("ldo1",   "ldo%s1",  &pmic4_nldo,      "vdd-l1-l9-l10"),
-	RPMH_VREG("ldo2",   "ldo%s2",  &pmic4_pldo,      "vdd-l2"),
-	RPMH_VREG("ldo3",   "ldo%s3",  &pmic4_pldo,      "vdd-l3-l5-l7-l8"),
-	RPMH_VREG("ldo4",   "ldo%s4",  &pmic4_pldo,      "vdd-l4-l6"),
-	RPMH_VREG("ldo5",   "ldo%s5",  &pmic4_pldo,      "vdd-l3-l5-l7-l8"),
-	RPMH_VREG("ldo6",   "ldo%s6",  &pmic4_pldo,      "vdd-l4-l6"),
-	RPMH_VREG("ldo7",   "ldo%s7",  &pmic4_pldo,      "vdd-l3-l5-l7-l8"),
-	RPMH_VREG("ldo8",   "ldo%s8",  &pmic4_pldo,      "vdd-l3-l5-l7-l8"),
-	RPMH_VREG("bob",    "bob%s1",  &pmic4_bob,       "vdd-bob"),
-	{}
-};
-
-static int rpmh_regulator_probe(struct platform_device *pdev)
+static int qcom_cpufreq_hw_lmh_init(struct cpufreq_policy *policy, int index,
+				    struct device *cpu_dev)
 {
-	struct device *dev = &pdev->dev;
-	const struct rpmh_vreg_init_data *vreg_data;
-	struct device_node *node;
-	struct rpmh_vreg *vreg;
-	const char *pmic_id;
+	struct qcom_cpufreq_data *data = policy->driver_data;
+	struct platform_device *pdev = cpufreq_get_driver_data();
 	int ret;
 
-	vreg_data = of_device_get_match_data(dev);
-	if (!vreg_data)
-		return -ENODEV;
+	/*
+	 * Look for LMh interrupt. If no interrupt line is specified /
+	 * if there is an error, allow cpufreq to be enabled as usual.
+	 */
+	data->throttle_irq = platform_get_irq_optional(pdev, index);
+	if (data->throttle_irq == -ENXIO)
+		return 0;
+	if (data->throttle_irq < 0)
+		return data->throttle_irq;
 
-	ret = of_property_read_string(dev->of_node, "qcom,pmic-id", &pmic_id);
-	if (ret < 0) {
-		dev_err(dev, "qcom,pmic-id missing in DT node\n");
-		return ret;
+	data->cancel_throttle = false;
+	data->policy = policy;
+
+	mutex_init(&data->throttle_lock);
+	INIT_DELAYED_WORK(&data->throttle_work, qcom_lmh_dcvs_poll);
+
+	snprintf(data->irq_name, sizeof(data->irq_name), "dcvsh-irq-%u", policy->cpu);
+	ret = request_threaded_irq(data->throttle_irq, NULL, qcom_lmh_dcvs_handle_irq,
+				   IRQF_ONESHOT | IRQF_NO_AUTOEN, data->irq_name, data);
+	if (ret) {
+		dev_err(&pdev->dev, "Error registering %s: %d\n", data->irq_name, ret);
+		return 0;
 	}
 
-	for_each_available_child_of_node(dev->of_node, node) {
-		vreg = devm_kzalloc(dev, sizeof(*vreg), GFP_KERNEL);
-		if (!vreg) {
-			of_node_put(node);
+	ret = irq_set_affinity_and_hint(data->throttle_irq, policy->cpus);
+	if (ret)
+		dev_err(&pdev->dev, "Failed to set CPU affinity of %s[%d]\n",
+			data->irq_name, data->throttle_irq);
+
+	sysfs_attr_init(&data->freq_limit_attr.attr);
+	data->freq_limit_attr.attr.name = "dcvsh_freq_limit";
+	data->freq_limit_attr.show = dcvsh_freq_limit_show;
+	data->freq_limit_attr.attr.mode = 0444;
+	data->dcvsh_freq_limit = U32_MAX;
+	device_create_file(cpu_dev, &data->freq_limit_attr);
+
+	return 0;
+}
+
+static int qcom_cpufreq_hw_cpu_online(struct cpufreq_policy *policy)
+{
+	struct qcom_cpufreq_data *data = policy->driver_data;
+	struct platform_device *pdev = cpufreq_get_driver_data();
+	int ret;
+
+	if (data->throttle_irq <= 0)
+		return 0;
+
+	mutex_lock(&data->throttle_lock);
+	data->cancel_throttle = false;
+	mutex_unlock(&data->throttle_lock);
+
+	ret = irq_set_affinity_and_hint(data->throttle_irq, policy->cpus);
+	if (ret)
+		dev_err(&pdev->dev, "Failed to set CPU affinity of %s[%d]\n",
+			data->irq_name, data->throttle_irq);
+
+	return ret;
+}
+
+static int qcom_cpufreq_hw_cpu_offline(struct cpufreq_policy *policy)
+{
+	struct qcom_cpufreq_data *data = policy->driver_data;
+
+	if (data->throttle_irq <= 0)
+		return 0;
+
+	mutex_lock(&data->throttle_lock);
+	data->cancel_throttle = true;
+	mutex_unlock(&data->throttle_lock);
+
+	cancel_delayed_work_sync(&data->throttle_work);
+	irq_set_affinity_and_hint(data->throttle_irq, NULL);
+	disable_irq_nosync(data->throttle_irq);
+
+	arch_update_thermal_pressure(policy->related_cpus, U32_MAX);
+	trace_dcvsh_throttle(cpumask_first(policy->related_cpus), 0);
+
+	return 0;
+}
+
+static void qcom_cpufreq_hw_lmh_exit(struct qcom_cpufreq_data *data)
+{
+	if (data->throttle_irq <= 0)
+		return;
+
+	free_irq(data->throttle_irq, data);
+}
+
+static int qcom_cpufreq_hw_cpu_init(struct cpufreq_policy *policy)
+{
+	struct platform_device *pdev = cpufreq_get_driver_data();
+	struct device *dev = &pdev->dev;
+	struct of_phandle_args args;
+	struct device_node *cpu_np;
+	struct device *cpu_dev;
+	struct resource *res;
+	void __iomem *base;
+	struct qcom_cpufreq_data *data;
+	char pdmem_name[MAX_FN_SIZE] = {};
+	int ret, index;
+
+	cpu_dev = get_cpu_device(policy->cpu);
+	if (!cpu_dev) {
+		pr_err("%s: failed to get cpu%d device\n", __func__,
+		       policy->cpu);
+		return -ENODEV;
+	}
+
+	cpu_np = of_cpu_device_node_get(policy->cpu);
+	if (!cpu_np)
+		return -EINVAL;
+
+	ret = of_parse_phandle_with_args(cpu_np, "qcom,freq-domain",
+					 "#freq-domain-cells", 0, &args);
+	of_node_put(cpu_np);
+	if (ret)
+		return ret;
+
+	index = args.args[0];
+
+	data = policy->driver_data;
+
+	if (!data) {
+		res = platform_get_resource(pdev, IORESOURCE_MEM, index);
+		if (!res) {
+			dev_err(dev, "failed to get mem resource %d\n", index);
+			return -ENODEV;
+		}
+
+		if (!devm_request_mem_region(dev, res->start, resource_size(res), res->name)) {
+			dev_err(dev, "failed to request resource %pR\n", res);
+			return -EBUSY;
+		}
+
+		base = devm_ioremap(dev, res->start, resource_size(res));
+		if (!base) {
+			dev_err(dev, "failed to map resource %pR\n", res);
 			return -ENOMEM;
 		}
 
-		ret = rpmh_regulator_init_vreg(vreg, dev, node, pmic_id,
-						vreg_data);
-		if (ret < 0) {
-			of_node_put(node);
+		data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
+		if (!data) {
+			return -ENOMEM;
+		}
+
+		ret = sysfs_create_file(&policy->kobj, &hw_clk_domain.attr);
+		if (ret) {
+			pr_err("%s: cannot register HW clock domain sysfs file\n", __func__);
 			return ret;
 		}
+
+		data->soc_data = of_device_get_match_data(&pdev->dev);
+		data->base = base;
+		data->res = res;
+		data->hw_clk_domain = index;
 	}
+
+	base = data->base;
+
+	/* HW should be in enabled state to proceed */
+	if (!(readl_relaxed(base + data->soc_data->reg_enable) & 0x1)) {
+		dev_err(dev, "Domain-%d cpufreq hardware not enabled\n", index);
+		ret = -ENODEV;
+		goto error;
+	}
+
+	if (readl_relaxed(base + data->soc_data->reg_dcvs_ctrl) & 0x1)
+		data->per_core_dcvs = true;
+
+	qcom_get_related_cpus(index, policy->cpus);
+	if (cpumask_empty(policy->cpus)) {
+		dev_err(dev, "Domain-%d failed to get related CPUs\n", index);
+		ret = -ENOENT;
+		goto error;
+	}
+
+	policy->driver_data = data;
+	policy->dvfs_possible_from_any_cpu = true;
+
+	ret = qcom_cpufreq_hw_read_lut(cpu_dev, policy);
+	if (ret) {
+		dev_err(dev, "Domain-%d failed to read LUT\n", index);
+		goto error;
+	}
+
+	if (data->soc_data->perf_lock_support) {
+		snprintf(pdmem_name, sizeof(pdmem_name), "pdmem-domain%d",
+								index);
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+								pdmem_name);
+		if (!res)
+			dev_err(dev, "PDMEM domain-%d failed\n", index);
+
+		base = devm_ioremap_resource(dev, res);
+		if (IS_ERR(base))
+			dev_err(dev, "Failed to map PDMEM domain-%d\n", index);
+		else
+			data->pdmem_base = base;
+	}
+
+	ret = dev_pm_opp_get_opp_count(cpu_dev);
+	if (ret <= 0) {
+		dev_err(cpu_dev, "Failed to add OPPs\n");
+		ret = -ENODEV;
+		goto error;
+	}
+
+	if (policy_has_boost_freq(policy)) {
+		ret = cpufreq_enable_boost_support();
+		if (ret)
+			dev_warn(cpu_dev, "failed to enable boost: %d\n", ret);
+	}
+
+	ret = qcom_cpufreq_hw_lmh_init(policy, index, cpu_dev);
+	if (ret)
+		goto error;
+
+	return 0;
+error:
+	policy->driver_data = NULL;
+	return ret;
+}
+
+static int qcom_cpufreq_hw_cpu_exit(struct cpufreq_policy *policy)
+{
+	struct device *cpu_dev = get_cpu_device(policy->cpu);
+
+	qcom_cpufreq_hw_lmh_exit(policy->driver_data);
+	dev_pm_opp_remove_all_dynamic(cpu_dev);
+	dev_pm_opp_of_cpumask_remove_table(policy->related_cpus);
+	kfree(policy->freq_table);
 
 	return 0;
 }
 
-static const struct of_device_id __maybe_unused rpmh_regulator_match_table[] = {
-	{
-		.compatible = "qcom,pm8005-rpmh-regulators",
-		.data = pm8005_vreg_data,
-	},
-	{
-		.compatible = "qcom,pm8009-rpmh-regulators",
-		.data = pm8009_vreg_data,
-	},
-	{
-		.compatible = "qcom,pm8009-1-rpmh-regulators",
-		.data = pm8009_1_vreg_data,
-	},
-	{
-		.compatible = "qcom,pm8150-rpmh-regulators",
-		.data = pm8150_vreg_data,
-	},
-	{
-		.compatible = "qcom,pm8150l-rpmh-regulators",
-		.data = pm8150l_vreg_data,
-	},
-	{
-		.compatible = "qcom,pm8350-rpmh-regulators",
-		.data = pm8350_vreg_data,
-	},
-	{
-		.compatible = "qcom,pm8350c-rpmh-regulators",
-		.data = pm8350c_vreg_data,
-	},
-	{
-		.compatible = "qcom,pm8450-rpmh-regulators",
-		.data = pm8450_vreg_data,
-	},
-	{
-		.compatible = "qcom,pm8998-rpmh-regulators",
-		.data = pm8998_vreg_data,
-	},
-	{
-		.compatible = "qcom,pmg1110-rpmh-regulators",
-		.data = pmg1110_vreg_data,
-	},
-	{
-		.compatible = "qcom,pmi8998-rpmh-regulators",
-		.data = pmi8998_vreg_data,
-	},
-	{
-		.compatible = "qcom,pm6150-rpmh-regulators",
-		.data = pm6150_vreg_data,
-	},
-	{
-		.compatible = "qcom,pm6150l-rpmh-regulators",
-		.data = pm6150l_vreg_data,
-	},
-	{
-		.compatible = "qcom,pm6350-rpmh-regulators",
-		.data = pm6350_vreg_data,
-	},
-	{
-		.compatible = "qcom,pmc8180-rpmh-regulators",
-		.data = pm8150_vreg_data,
-	},
-	{
-		.compatible = "qcom,pmc8180c-rpmh-regulators",
-		.data = pm8150l_vreg_data,
-	},
-	{
-		.compatible = "qcom,pmm8155au-rpmh-regulators",
-		.data = pmm8155au_vreg_data,
-	},
-	{
-		.compatible = "qcom,pmx55-rpmh-regulators",
-		.data = pmx55_vreg_data,
-	},
-	{
-		.compatible = "qcom,pmx65-rpmh-regulators",
-		.data = pmx65_vreg_data,
-	},
-	{
-		.compatible = "qcom,pm7325-rpmh-regulators",
-		.data = pm7325_vreg_data,
-	},
-	{
-		.compatible = "qcom,pmr735a-rpmh-regulators",
-		.data = pmr735a_vreg_data,
-	},
-	{
-		.compatible = "qcom,pm660-rpmh-regulators",
-		.data = pm660_vreg_data,
-	},
-	{
-		.compatible = "qcom,pm660l-rpmh-regulators",
-		.data = pm660l_vreg_data,
-	},
-	{}
-};
-MODULE_DEVICE_TABLE(of, rpmh_regulator_match_table);
+static void qcom_cpufreq_ready(struct cpufreq_policy *policy)
+{
+	struct qcom_cpufreq_data *data = policy->driver_data;
 
-static struct platform_driver rpmh_regulator_driver = {
+	if (data->throttle_irq >= 0)
+		enable_irq(data->throttle_irq);
+}
+
+static struct freq_attr *qcom_cpufreq_hw_attr[] = {
+	&cpufreq_freq_attr_scaling_available_freqs,
+	&cpufreq_freq_attr_scaling_boost_freqs,
+	NULL
+};
+
+static struct cpufreq_driver cpufreq_qcom_hw_driver = {
+	.flags		= CPUFREQ_NEED_INITIAL_FREQ_CHECK |
+			  CPUFREQ_HAVE_GOVERNOR_PER_POLICY |
+			  CPUFREQ_IS_COOLING_DEV,
+	.verify		= cpufreq_generic_frequency_table_verify,
+	.target_index	= qcom_cpufreq_hw_target_index,
+	.get		= qcom_cpufreq_hw_get,
+	.init		= qcom_cpufreq_hw_cpu_init,
+	.exit		= qcom_cpufreq_hw_cpu_exit,
+	.online		= qcom_cpufreq_hw_cpu_online,
+	.offline	= qcom_cpufreq_hw_cpu_offline,
+	.register_em	= cpufreq_register_em_with_opp,
+	.fast_switch    = qcom_cpufreq_hw_fast_switch,
+	.name		= "qcom-cpufreq-hw",
+	.attr		= qcom_cpufreq_hw_attr,
+	.ready		= qcom_cpufreq_ready,
+	.boost_enabled	= true,
+};
+
+static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
+{
+	struct device *cpu_dev;
+	struct clk *clk;
+	int ret, cpu;
+
+	clk = clk_get(&pdev->dev, "xo");
+	if (IS_ERR(clk))
+		return PTR_ERR(clk);
+
+	xo_rate = clk_get_rate(clk);
+	clk_put(clk);
+
+	clk = clk_get(&pdev->dev, "alternate");
+	if (IS_ERR(clk))
+		return PTR_ERR(clk);
+
+	cpu_hw_rate = clk_get_rate(clk) / CLK_HW_DIV;
+	clk_put(clk);
+
+	cpufreq_qcom_hw_driver.driver_data = pdev;
+
+	/* Check for optional interconnect paths on CPU0 */
+	cpu_dev = get_cpu_device(0);
+	if (!cpu_dev)
+		return -EPROBE_DEFER;
+
+	ret = dev_pm_opp_of_find_icc_paths(cpu_dev, NULL);
+	if (ret)
+		return ret;
+
+	for_each_possible_cpu(cpu)
+		spin_lock_init(&qcom_cpufreq_counter[cpu].lock);
+
+	ret = cpufreq_register_driver(&cpufreq_qcom_hw_driver);
+	if (ret)
+		dev_err(&pdev->dev, "CPUFreq HW driver failed to register\n");
+	else
+		dev_dbg(&pdev->dev, "QCOM CPUFreq HW driver initialized\n");
+
+	return ret;
+}
+
+static int qcom_cpufreq_hw_driver_remove(struct platform_device *pdev)
+{
+	return cpufreq_unregister_driver(&cpufreq_qcom_hw_driver);
+}
+
+static struct platform_driver qcom_cpufreq_hw_driver = {
+	.probe = qcom_cpufreq_hw_driver_probe,
+	.remove = qcom_cpufreq_hw_driver_remove,
 	.driver = {
-		.name = "qcom-rpmh-regulator",
-		.of_match_table	= of_match_ptr(rpmh_regulator_match_table),
+		.name = "qcom-cpufreq-hw",
+		.of_match_table = qcom_cpufreq_hw_match,
 	},
-	.probe = rpmh_regulator_probe,
 };
-module_platform_driver(rpmh_regulator_driver);
 
-MODULE_DESCRIPTION("Qualcomm RPMh regulator driver");
+static int __init qcom_cpufreq_hw_init(void)
+{
+	return platform_driver_register(&qcom_cpufreq_hw_driver);
+}
+postcore_initcall(qcom_cpufreq_hw_init);
+
+static void __exit qcom_cpufreq_hw_exit(void)
+{
+	platform_driver_unregister(&qcom_cpufreq_hw_driver);
+}
+module_exit(qcom_cpufreq_hw_exit);
+
+MODULE_DESCRIPTION("QCOM CPUFREQ HW Driver");
 MODULE_LICENSE("GPL v2");
