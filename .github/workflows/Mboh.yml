@@ -1,4 +1,4 @@
-name: buildmodule
+name: modulejembut
 
 on:
   pull_request:
