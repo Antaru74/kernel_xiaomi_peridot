@@ -1,0 +1,44 @@
+    - name: Build rpmh-regulator module only
+      id: build
+      working-directory: ${{ steps.kernel.outputs.kernel-folder }}
+      run: |
+        export PATH="$HOME/tc/clang/bin:$PATH"
+        export LD_LIBRARY_PATH=$HOME/tc/clang/lib64:$LD_LIBRARY_PATH
+
+        OUT_DIR=out
+        DATE=$(date '+%Y%m%d-%H%M')
+        VERSION="rpmh-regulator-${{ github.event.inputs.CODENAME }}-${DATE}"
+        CORES=$(nproc)
+
+        ARGS="ARCH=arm64 \
+        O=${OUT_DIR} \
+        CC=clang \
+        LD=ld.lld \
+        CLANG_TRIPLE=aarch64-linux-gnu- \
+        CROSS_COMPILE=aarch64-linux-gnu- \
+        CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+        -j${CORES}"
+
+        # Generate defconfig
+        make ${ARGS} peridot_defconfig
+
+        # Force config as module (tanpa scripts/config)
+        sed -i 's/^CONFIG_REGULATOR_RPMH=y/CONFIG_REGULATOR_RPMH=m/' ${OUT_DIR}/.config
+        sed -i 's/^# CONFIG_REGULATOR_RPMH is not set/CONFIG_REGULATOR_RPMH=m/' ${OUT_DIR}/.config
+
+        # Pastikan REGULATOR aktif
+        sed -i 's/^# CONFIG_REGULATOR is not set/CONFIG_REGULATOR=y/' ${OUT_DIR}/.config
+
+        make ${ARGS} olddefconfig
+
+        # Build hanya regulator folder
+        make ${ARGS} M=drivers/regulator modules
+
+        mkdir module_out
+        cp ${OUT_DIR}/drivers/regulator/rpmh-regulator.ko module_out/
+
+        cd module_out
+        zip -r9 "../${VERSION}.zip" .
+        cd ..
+
+        echo "zipname=${VERSION}.zip" >> $GITHUB_OUTPUT
