@@ -1,14 +1,95 @@
-    - name: Build rpmh-regulator module only
+name: buildmodule
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      BUILD_TITLE:
+        description: 'Custom Build Title'
+        required: false
+      KERNEL_TREE:
+        description: 'Kernel Tree'
+        default: 'https://github.com/Antaru74/kernel_xiaomi_peridot'
+        required: true
+      KERNEL_TREE_BRANCH:
+        description: 'Kernel Tree Branch'
+        required: true
+        default: 'stable-r1'
+      CODENAME:
+        description: 'Phone Codename'
+        default: 'peridot'
+        required: true
+      UPLOAD_TO_RELEASE:
+        description: 'Upload to release'
+        type: boolean
+        default: false
+      NOTIFY_START:
+        description: 'Notify Build Start'
+        type: boolean
+        default: true
+      NOTIFY_SUCCESS:
+        description: 'Notify Build Success'
+        type: boolean
+        default: true
+      TELEGRAM_CHAT_ID:
+        description: 'Telegram Chat ID (optional)'
+        required: false
+
+jobs:
+  build:
+    if: github.event.repository.owner.id == github.event.sender.id
+    runs-on: ubuntu-latest
+    environment: Telegram
+    permissions:
+      contents: write
+
+    steps:
+    - name: Display Inputs
+      run: |
+        echo "Kernel Tree: ${{ github.event.inputs.KERNEL_TREE }}"
+        echo "Branch: ${{ github.event.inputs.KERNEL_TREE_BRANCH }}"
+        echo "Codename: ${{ github.event.inputs.CODENAME }}"
+
+    - name: Notify Build Start
+      if: ${{ github.event.inputs.NOTIFY_START == 'true' }}
+      uses: appleboy/telegram-action@master
+      with:
+        to: ${{ github.event.inputs.TELEGRAM_CHAT_ID || secrets.TELEGRAM_CHAT_ID }}
+        token: ${{ secrets.TELEGRAM_TOKEN }}
+        format: html
+        message: |
+          <b>🚀 rpmh-regulator MODULE Build Started</b>
+          <b>Device</b>: <code>${{ github.event.inputs.CODENAME }}</code>
+
+    - name: Install dependencies
+      run: |
+        sudo apt update -y
+        sudo apt install -y flex bison libncurses-dev libssl-dev bc \
+          build-essential git ccache binutils-aarch64-linux-gnu
+
+        mkdir -p $HOME/tc
+        cd $HOME/tc
+        wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz -O clang.tar.gz
+        mkdir clang
+        tar -xf clang.tar.gz -C clang
+
+    - name: Clone kernel source
+      run: |
+        git clone --depth=1 \
+          -b ${{ github.event.inputs.KERNEL_TREE_BRANCH }} \
+          ${{ github.event.inputs.KERNEL_TREE }} kernel
+
+    - name: Build rpmh-regulator.ko only
       id: build
-      working-directory: ${{ steps.kernel.outputs.kernel-folder }}
+      working-directory: kernel
       run: |
         export PATH="$HOME/tc/clang/bin:$PATH"
         export LD_LIBRARY_PATH=$HOME/tc/clang/lib64:$LD_LIBRARY_PATH
 
         OUT_DIR=out
+        CORES=$(nproc)
         DATE=$(date '+%Y%m%d-%H%M')
         VERSION="rpmh-regulator-${{ github.event.inputs.CODENAME }}-${DATE}"
-        CORES=$(nproc)
 
         ARGS="ARCH=arm64 \
         O=${OUT_DIR} \
@@ -19,26 +100,50 @@
         CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
         -j${CORES}"
 
-        # Generate defconfig
+        # Load defconfig
         make ${ARGS} peridot_defconfig
-
-        # Force config as module (tanpa scripts/config)
-        sed -i 's/^CONFIG_REGULATOR_RPMH=y/CONFIG_REGULATOR_RPMH=m/' ${OUT_DIR}/.config
-        sed -i 's/^# CONFIG_REGULATOR_RPMH is not set/CONFIG_REGULATOR_RPMH=m/' ${OUT_DIR}/.config
-
-        # Pastikan REGULATOR aktif
-        sed -i 's/^# CONFIG_REGULATOR is not set/CONFIG_REGULATOR=y/' ${OUT_DIR}/.config
-
         make ${ARGS} olddefconfig
 
-        # Build hanya regulator folder
+        # IMPORTANT: force rpmh regulator as module
+        scripts/config --file ${OUT_DIR}/.config -m CONFIG_REGULATOR_RPMH
+        make ${ARGS} olddefconfig
+
+        # Build only regulator folder
         make ${ARGS} M=drivers/regulator modules
 
+        MODULE_PATH=$(find ${OUT_DIR} -name rpmh-regulator.ko)
+
+        if [ -z "$MODULE_PATH" ]; then
+          echo "rpmh-regulator.ko not found!"
+          exit 1
+        fi
+
         mkdir module_out
-        cp ${OUT_DIR}/drivers/regulator/rpmh-regulator.ko module_out/
+        cp $MODULE_PATH module_out/
 
         cd module_out
-        zip -r9 "../${VERSION}.zip" .
+        zip -r9 "../${VERSION}.zip" rpmh-regulator.ko
         cd ..
 
         echo "zipname=${VERSION}.zip" >> $GITHUB_OUTPUT
+
+    - name: Upload to Release
+      if: ${{ github.event.inputs.UPLOAD_TO_RELEASE == 'true' }}
+      uses: softprops/action-gh-release@v2
+      with:
+        files: kernel/${{ steps.build.outputs.zipname }}
+        name: rpmh-regulator-${{ github.event.inputs.CODENAME }}
+        tag_name: rpmh-regulator-${{ github.event.inputs.CODENAME }}-${{ github.run_number }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Notify Build Success
+      if: ${{ success() && github.event.inputs.NOTIFY_SUCCESS == 'true' }}
+      uses: appleboy/telegram-action@master
+      with:
+        to: ${{ github.event.inputs.TELEGRAM_CHAT_ID || secrets.TELEGRAM_CHAT_ID }}
+        token: ${{ secrets.TELEGRAM_TOKEN }}
+        format: html
+        message: |
+          <b>✅ rpmh-regulator MODULE Build Succeeded</b>
+          <b>File</b>: <code>${{ steps.build.outputs.zipname }}</code>
