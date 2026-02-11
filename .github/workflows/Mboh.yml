@@ -1,4 +1,4 @@
-name: Mboh
+name: buildmodule
 
 on:
   pull_request:
@@ -60,7 +60,6 @@ jobs:
         echo "Kernel Tree: ${{ github.event.inputs.KERNEL_TREE }}"
         echo "Branch: ${{ github.event.inputs.KERNEL_TREE_BRANCH }}"
         echo "Codename: ${{ github.event.inputs.CODENAME }}"
-        echo "KernelSU Option: ${{ github.event.inputs.KERNELSU_OPTION }}"
         echo "::endgroup::"
 
     - name: Notify Build Start
@@ -71,47 +70,63 @@ jobs:
         token: ${{ secrets.TELEGRAM_TOKEN }}
         format: html
         message: |
-          <b>🚀 Kernel Partial Build Started</b>
-          <b>Target</b>: qcom-cpufreq-undervolt.o
+          <b>🚀 Kernel MODULE Build Started</b>
           <b>Device</b>: <code>${{ github.event.inputs.CODENAME }}</code>
 
-    - name: Prepare build environment
+    - name: Generate Build Date
+      id: build_date
+      run: |
+        echo "build_date=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
+
+    - name: Initialize workspace
+      id: workspace
+      run: |
+        mkdir workspace
+        cd workspace
+        echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
+        echo "build_title=${{ github.event.inputs.BUILD_TITLE || github.event.inputs.CODENAME }}" >> $GITHUB_OUTPUT
+
+    - name: Prepare the build environment
       run: |
         sudo apt update -y
-        sudo apt install -y \
-          flex bison bc build-essential git ccache \
-          libncurses-dev libssl-dev binutils-aarch64-linux-gnu
+        sudo apt install -y flex bison libncurses-dev libssl-dev bc \
+          build-essential git ccache binutils-aarch64-linux-gnu
 
         mkdir -p $HOME/tc
         cd $HOME/tc
-        wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz -O clang.tar.gz
+        wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz -O clang.tar.gz
         mkdir clang
         tar -xf clang.tar.gz -C clang
 
     - name: Clone kernel source
+      id: kernel
+      working-directory: ${{ steps.workspace.outputs.workspace-folder }}
       run: |
         git clone --depth=1 \
           -b ${{ github.event.inputs.KERNEL_TREE_BRANCH }} \
           ${{ github.event.inputs.KERNEL_TREE }} kernel_tree
+        echo "kernel-folder=$(pwd)/kernel_tree" >> $GITHUB_OUTPUT
 
-    - name: Build qcom-cpufreq-undervolt.o
-      working-directory: kernel_tree
+    - name: Building kernel modules
+      id: build
+      working-directory: ${{ steps.kernel.outputs.kernel-folder }}
       run: |
-        set -e
-
-        echo "===> KernelSU setup"
         rm -rf KernelSU-Next
-        if [[ "${{ github.event.inputs.KERNELSU_OPTION }}" == "1" ]]; then
+
+        if [[ "${{ github.event.inputs.KERNELSU_OPTION }}" == '1' ]]; then
           curl -LSs https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh | bash -s next
-        elif [[ "${{ github.event.inputs.KERNELSU_OPTION }}" == "2" ]]; then
+        elif [[ "${{ github.event.inputs.KERNELSU_OPTION }}" == '2' ]]; then
           curl -LSs https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next-susfs/kernel/setup.sh | bash -s next-susfs
         fi
 
         export PATH="$HOME/tc/clang/bin:$PATH"
-        export LD_LIBRARY_PATH="$HOME/tc/clang/lib64:$LD_LIBRARY_PATH"
+        export LD_LIBRARY_PATH=$HOME/tc/clang/lib64:$LD_LIBRARY_PATH
 
         OUT_DIR=out
-        JOBS=$(nproc)
+        DATE=$(date '+%Y%m%d-%H%M')
+        VERSION="modules-${{ github.event.inputs.CODENAME }}-${DATE}"
+
+        CORES=$(nproc)
 
         ARGS="ARCH=arm64 \
         O=${OUT_DIR} \
@@ -119,21 +134,32 @@ jobs:
         LD=ld.lld \
         CLANG_TRIPLE=aarch64-linux-gnu- \
         CROSS_COMPILE=aarch64-linux-gnu- \
-        CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
+        CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+        -j${CORES}"
 
-        echo "===> Defconfig"
         make ${ARGS} peridot_defconfig
+        make ${ARGS} olddefconfig
+        make ${ARGS} modules
 
-        echo "===> Prepare kernel"
-        make ${ARGS} prepare
-        make ${ARGS} scripts
+        mkdir modules_zip
+        find ${OUT_DIR} -type f -name '*.ko' -exec cp --parents {} modules_zip/ \;
 
-        echo "===> Build ONLY drivers/cpufreq/qcom-cpufreq-undervolt.o"
-        make ${ARGS} drivers/cpufreq/qcom-cpufreq-undervolt.o -j${JOBS}
+        cd modules_zip
+        zip -r9 "../${VERSION}.zip" .
+        cd ..
 
-        echo "===> Verify output"
-        test -f out/drivers/cpufreq/qcom-cpufreq-undervolt.o
-        ls -lh out/drivers/cpufreq/qcom-cpufreq-undervolt.o
+        echo "zipname=${VERSION}.zip" >> $GITHUB_OUTPUT
+
+    - name: Upload to Release
+      if: ${{ github.event.inputs.UPLOAD_TO_RELEASE == 'true' }}
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          ${{ steps.kernel.outputs.kernel-folder }}/${{ steps.build.outputs.zipname }}
+        name: modules-${{ github.event.inputs.CODENAME }}-${{ steps.build_date.outputs.build_date }}
+        tag_name: modules-${{ github.event.inputs.CODENAME }}-${{ steps.build_date.outputs.build_date }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Notify Build Success
       if: ${{ success() && github.event.inputs.NOTIFY_SUCCESS == 'true' }}
@@ -143,6 +169,5 @@ jobs:
         token: ${{ secrets.TELEGRAM_TOKEN }}
         format: html
         message: |
-          <b>✅ Build Success</b>
-          <b>File</b>: qcom-cpufreq-undervolt.o
-          <b>Path</b>: out/drivers/cpufreq/
+          <b>✅ Kernel MODULE Build Succeeded</b>
+          <b>File</b>: <code>${{ steps.build.outputs.zipname }}</code>
