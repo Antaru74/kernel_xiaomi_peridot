@@ -1,6 +1,7 @@
+
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2016-2021, The Linux Foundation. All rights reserved. */
-/* Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved. */
+/* Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved. */
 
 #define pr_fmt(fmt) "%s: " fmt, __func__
 
@@ -35,11 +36,16 @@
  *				type PMIC regulators.
  * %RPMH_REGULATOR_TYPE_XOB:	RPMh XOB accelerator which supports voting on
  *				the enable state of PMIC regulators.
+ * %RPMH_REGULATOR_TYPE_PBS:	RPMh PBS accelerator which supports voting on
+ *				the enable state of PBS resources, which are
+ *				used to trigger PBS sequences for HW controlled
+ *				regulator enable states.
  */
 enum rpmh_regulator_type {
 	RPMH_REGULATOR_TYPE_VRM,
 	RPMH_REGULATOR_TYPE_ARC,
 	RPMH_REGULATOR_TYPE_XOB,
+	RPMH_REGULATOR_TYPE_PBS,
 };
 
 /**
@@ -56,6 +62,10 @@ enum rpmh_regulator_hw_type {
 	RPMH_REGULATOR_HW_TYPE_PMIC5_HFSMPS,
 	RPMH_REGULATOR_HW_TYPE_PMIC5_FTSMPS,
 	RPMH_REGULATOR_HW_TYPE_PMIC5_BOB,
+	RPMH_REGULATOR_HW_TYPE_PMIC7_LDO,
+	RPMH_REGULATOR_HW_TYPE_PMIC7_HFSMPS,
+	RPMH_REGULATOR_HW_TYPE_PMIC7_FTSMPS,
+	RPMH_REGULATOR_HW_TYPE_PMIC7_BOB,
 	RPMH_REGULATOR_HW_TYPE_MAX,
 };
 
@@ -63,6 +73,7 @@ enum rpmh_regulator_hw_type {
  * enum rpmh_regulator_reg_index - RPMh accelerator register indices
  * %RPMH_REGULATOR_REG_VRM_VOLTAGE:	VRM voltage voting register index
  * %RPMH_REGULATOR_REG_ARC_LEVEL:	ARC voltage level voting register index
+ * %RPMH_REGULATOR_REG_PBS_ENABLE:	PBS enable voting register index
  * %RPMH_REGULATOR_REG_VRM_ENABLE:	VRM enable voltage voting register index
  * %RPMH_REGULATOR_REG_ARC_PSEUDO_ENABLE: Place-holder for enable aggregation.
  *					ARC does not have a specific register
@@ -75,6 +86,8 @@ enum rpmh_regulator_hw_type {
  * %RPMH_REGULATOR_REG_VRM_MODE:	VRM regulator mode voting register index
  * %RPMH_REGULATOR_REG_VRM_HEADROOM:	VRM headroom voltage voting register
  *					index
+ * %RPMH_REGULATOR_REG_PBS_MAX:		Exclusive upper limit of PBS register
+ *					indices
  * %RPMH_REGULATOR_REG_ARC_REAL_MAX:	Upper limit of real existent ARC
  *					register indices
  * %RPMH_REGULATOR_REG_ARC_MAX:		Exclusive upper limit of ARC register
@@ -91,12 +104,14 @@ enum rpmh_regulator_hw_type {
 enum rpmh_regulator_reg_index {
 	RPMH_REGULATOR_REG_VRM_VOLTAGE		= 0,
 	RPMH_REGULATOR_REG_ARC_LEVEL		= 0,
+	RPMH_REGULATOR_REG_PBS_ENABLE		= 0,
 	RPMH_REGULATOR_REG_VRM_ENABLE		= 1,
 	RPMH_REGULATOR_REG_ARC_PSEUDO_ENABLE	= RPMH_REGULATOR_REG_VRM_ENABLE,
 	RPMH_REGULATOR_REG_XOB_ENABLE		= RPMH_REGULATOR_REG_VRM_ENABLE,
 	RPMH_REGULATOR_REG_ENABLE		= RPMH_REGULATOR_REG_VRM_ENABLE,
 	RPMH_REGULATOR_REG_VRM_MODE		= 2,
 	RPMH_REGULATOR_REG_VRM_HEADROOM		= 3,
+	RPMH_REGULATOR_REG_PBS_MAX		= 1,
 	RPMH_REGULATOR_REG_ARC_REAL_MAX		= 1,
 	RPMH_REGULATOR_REG_ARC_MAX		= 2,
 	RPMH_REGULATOR_REG_XOB_MAX		= 2,
@@ -128,8 +143,9 @@ enum rpmh_regulator_reg_index {
 #define RPMH_VRM_MODE_MIN		0
 #define RPMH_VRM_MODE_MAX		7
 
-/* XOB voting registers are found in the VRM hardware module */
+/* XOB and PBS voting registers are found in the VRM hardware module */
 #define CMD_DB_HW_XOB			CMD_DB_HW_VRM
+#define CMD_DB_HW_PBS			CMD_DB_HW_VRM
 
 #define IPC_LOG_PAGES			10
 
@@ -310,6 +326,11 @@ struct rpmh_vreg {
 #define RPMH_REGULATOR_MODE_PMIC5_BOB_AUTO	6
 #define RPMH_REGULATOR_MODE_PMIC5_BOB_PWM	7
 
+#define RPMH_REGULATOR_MODE_PMIC7_LDO_RM	3
+#define RPMH_REGULATOR_MODE_PMIC7_LDO_LPM	4
+#define RPMH_REGULATOR_MODE_PMIC7_LDO_OPM	5
+#define RPMH_REGULATOR_MODE_PMIC7_LDO_HPM	7
+
 /*
  * Mappings from RPMh generic modes to VRM accelerator modes and regulator
  * framework modes for each regulator type.
@@ -438,6 +459,27 @@ rpmh_regulator_mode_map_pmic5_bob[RPMH_REGULATOR_MODE_COUNT] = {
 	},
 };
 
+/* For PMIC7, only LDOs have a mode control delta vs PMIC5 (i.e. OPM added). */
+static const struct rpmh_regulator_mode
+rpmh_regulator_mode_map_pmic7_ldo[RPMH_REGULATOR_MODE_COUNT] = {
+	[RPMH_REGULATOR_MODE_RET] = {
+		.pmic_mode = RPMH_REGULATOR_MODE_PMIC7_LDO_RM,
+		.framework_mode = REGULATOR_MODE_STANDBY,
+	},
+	[RPMH_REGULATOR_MODE_LPM] = {
+		.pmic_mode = RPMH_REGULATOR_MODE_PMIC7_LDO_LPM,
+		.framework_mode = REGULATOR_MODE_IDLE,
+	},
+	[RPMH_REGULATOR_MODE_AUTO] = {
+		.pmic_mode = RPMH_REGULATOR_MODE_PMIC7_LDO_OPM,
+		.framework_mode = REGULATOR_MODE_NORMAL,
+	},
+	[RPMH_REGULATOR_MODE_HPM] = {
+		.pmic_mode = RPMH_REGULATOR_MODE_PMIC7_LDO_HPM,
+		.framework_mode = REGULATOR_MODE_FAST,
+	},
+};
+
 static const struct rpmh_regulator_mode * const
 rpmh_regulator_mode_map[RPMH_REGULATOR_HW_TYPE_MAX] = {
 	[RPMH_REGULATOR_HW_TYPE_PMIC4_LDO]
@@ -455,6 +497,14 @@ rpmh_regulator_mode_map[RPMH_REGULATOR_HW_TYPE_MAX] = {
 	[RPMH_REGULATOR_HW_TYPE_PMIC5_FTSMPS]
 		= rpmh_regulator_mode_map_pmic5_ftsmps,
 	[RPMH_REGULATOR_HW_TYPE_PMIC5_BOB]
+		= rpmh_regulator_mode_map_pmic5_bob,
+	[RPMH_REGULATOR_HW_TYPE_PMIC7_LDO]
+		= rpmh_regulator_mode_map_pmic7_ldo,
+	[RPMH_REGULATOR_HW_TYPE_PMIC7_HFSMPS]
+		= rpmh_regulator_mode_map_pmic5_hfsmps,
+	[RPMH_REGULATOR_HW_TYPE_PMIC7_FTSMPS]
+		= rpmh_regulator_mode_map_pmic5_ftsmps,
+	[RPMH_REGULATOR_HW_TYPE_PMIC7_BOB]
 		= rpmh_regulator_mode_map_pmic5_bob,
 };
 
@@ -501,10 +551,15 @@ static const char *const rpmh_regulator_xob_param_names[] = {
 	[RPMH_REGULATOR_REG_XOB_ENABLE]		= "en",
 };
 
+static const char *const rpmh_regulator_pbs_param_names[] = {
+	[RPMH_REGULATOR_REG_PBS_ENABLE]		= "en",
+};
+
 static const int max_reg_index_map[] = {
 	[RPMH_REGULATOR_TYPE_VRM] = RPMH_REGULATOR_REG_VRM_MAX,
 	[RPMH_REGULATOR_TYPE_ARC] = RPMH_REGULATOR_REG_ARC_MAX,
 	[RPMH_REGULATOR_TYPE_XOB] = RPMH_REGULATOR_REG_XOB_MAX,
+	[RPMH_REGULATOR_TYPE_PBS] = RPMH_REGULATOR_REG_PBS_MAX,
 };
 
 /**
@@ -560,6 +615,10 @@ static void rpmh_regulator_req(struct rpmh_vreg *vreg,
 	case RPMH_REGULATOR_TYPE_XOB:
 		max_reg_index = RPMH_REGULATOR_REG_XOB_MAX;
 		param_name = rpmh_regulator_xob_param_names;
+		break;
+	case RPMH_REGULATOR_TYPE_PBS:
+		max_reg_index = RPMH_REGULATOR_REG_PBS_MAX;
+		param_name = rpmh_regulator_pbs_param_names;
 		break;
 	default:
 		return;
@@ -958,9 +1017,13 @@ static u32 rpmh_regulator_set_reg(struct rpmh_vreg *vreg, int reg_index,
 static void rpmh_regulator_check_param_max(struct rpmh_aggr_vreg *aggr_vreg,
 					int index, u32 new_max)
 {
-	if ((aggr_vreg->aggr_req_active.valid & BIT(index))
-	    && aggr_vreg->aggr_req_active.reg[index] > new_max)
-		aggr_vreg->next_wait_for_ack = true;
+	/* HAPUS - TIDAK PERLU VALIDASI LAGI */
+	// if ((aggr_vreg->aggr_req_active.valid & BIT(index))
+	//     && aggr_vreg->aggr_req_active.reg[index] > new_max)
+	//	aggr_vreg->next_wait_for_ack = true;
+	
+	/* SELALU WAIT FOR ACK UNTUK KEAMANAN (opsional) */
+	aggr_vreg->next_wait_for_ack = true;
 }
 
 /**
@@ -982,6 +1045,27 @@ static int rpmh_regulator_is_enabled(struct regulator_dev *rdev)
 	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
 
 	return !!vreg->req.reg[RPMH_REGULATOR_REG_ENABLE];
+}
+
+/**
+ * rpmh_regulator_pbs_is_enabled() - return the enable state of the PBS
+ *		RPMh regulator
+ * @rdev:		Regulator device pointer for the rpmh-regulator
+ *
+ * This function is passed as a callback function into the regulator ops that
+ * are registered for each rpmh-regulator device.
+ *
+ * Note that for PBS regulators, the enable offset is different from that of
+ * other regulators, so it has a different set of enablement-related callbacks.
+ *
+ * Return: true if regulator is enabled, false if regulator is disabled
+ */
+
+static int rpmh_regulator_pbs_is_enabled(struct regulator_dev *rdev)
+{
+	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
+
+	return !!vreg->req.reg[RPMH_REGULATOR_REG_PBS_ENABLE];
 }
 
 /**
@@ -1012,6 +1096,29 @@ static int rpmh_regulator_enable(struct regulator_dev *rdev)
 	if (rc) {
 		vreg_err(vreg, "enable failed, rc=%d\n", rc);
 		rpmh_regulator_set_reg(vreg, RPMH_REGULATOR_REG_ENABLE,
+					prev_enable);
+	}
+
+	mutex_unlock(&vreg->aggr_vreg->lock);
+
+	return rc;
+}
+
+static int rpmh_regulator_pbs_enable(struct regulator_dev *rdev)
+{
+	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
+	u32 prev_enable;
+	int rc;
+
+	mutex_lock(&vreg->aggr_vreg->lock);
+
+	prev_enable
+	       = rpmh_regulator_set_reg(vreg, RPMH_REGULATOR_REG_PBS_ENABLE, 1);
+
+	rc = rpmh_regulator_send_aggregate_requests(vreg);
+	if (rc) {
+		vreg_err(vreg, "enable failed, rc=%d\n", rc);
+		rpmh_regulator_set_reg(vreg, RPMH_REGULATOR_REG_PBS_ENABLE,
 					prev_enable);
 	}
 
@@ -1056,6 +1163,29 @@ static int rpmh_regulator_disable(struct regulator_dev *rdev)
 	return rc;
 }
 
+static int rpmh_regulator_pbs_disable(struct regulator_dev *rdev)
+{
+	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
+	u32 prev_enable;
+	int rc;
+
+	mutex_lock(&vreg->aggr_vreg->lock);
+
+	prev_enable
+	       = rpmh_regulator_set_reg(vreg, RPMH_REGULATOR_REG_PBS_ENABLE, 0);
+
+	rc = rpmh_regulator_send_aggregate_requests(vreg);
+	if (rc) {
+		vreg_err(vreg, "disable failed, rc=%d\n", rc);
+		rpmh_regulator_set_reg(vreg, RPMH_REGULATOR_REG_PBS_ENABLE,
+					prev_enable);
+	}
+
+	mutex_unlock(&vreg->aggr_vreg->lock);
+
+	return rc;
+}
+
 /**
  * rpmh_regulator_vrm_set_voltage() - set the voltage of the VRM rpmh-regulator
  * @rdev:		Regulator device pointer for the rpmh-regulator
@@ -1076,17 +1206,27 @@ static int rpmh_regulator_vrm_set_voltage(struct regulator_dev *rdev,
 	int mv;
 	int rc = 0;
 
+	/* HAPUS VALIDASI INI - USER BEBAS MENGATUR */
+	// mv = DIV_ROUND_UP(min_uv, 1000);
+	// if (mv * 1000 > max_uv) {
+	//	vreg_err(vreg, "no set points available in range %d-%d uV\n",
+	//		min_uv, max_uv);
+	//	return -EINVAL;
+	// }
+
+	/* LANGSUNG PAKAI min_uv, HANYA CLAMP KE BATAS HARDWARE */
 	mv = DIV_ROUND_UP(min_uv, 1000);
-	if (mv * 1000 > max_uv) {
-		vreg_err(vreg, "no set points available in range %d-%d uV\n",
-			min_uv, max_uv);
-		return -EINVAL;
-	}
+	
+	/* Clamp ke batas hardware PMIC untuk keamanan minimal */
+	if (mv < 0) mv = 0;
+	if (mv > 8191) mv = 8191; /* RPMH_VRM_MAX_UV/1000 = 8191 */
 
 	mutex_lock(&vreg->aggr_vreg->lock);
 
 	prev_voltage
 	     = rpmh_regulator_set_reg(vreg, RPMH_REGULATOR_REG_VRM_VOLTAGE, mv);
+	
+	/* HAPUS ATAU MODIFIKASI check_param_max */
 	rpmh_regulator_check_param_max(vreg->aggr_vreg,
 				RPMH_REGULATOR_REG_VRM_VOLTAGE, max_uv);
 
@@ -1137,6 +1277,10 @@ static int rpmh_regulator_vrm_set_mode_index(struct rpmh_vreg *vreg,
 	u32 prev_mode;
 	int rc;
 
+	/* HAPUS VALIDASI mode_index */
+	// if (mode_index >= vreg->aggr_vreg->mode_count)
+	//    mode_index = 0;
+
 	mutex_lock(&vreg->aggr_vreg->lock);
 
 	prev_mode = rpmh_regulator_set_reg(vreg, RPMH_REGULATOR_REG_VRM_MODE,
@@ -1180,13 +1324,14 @@ static int rpmh_regulator_vrm_set_mode(struct regulator_dev *rdev,
 	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
 	int i;
 
+	/* HAPUS VALIDASI - TERIMA SEMUA MODE */
 	for (i = 0; i < vreg->aggr_vreg->mode_count; i++)
 		if (vreg->aggr_vreg->mode[i].framework_mode == mode)
 			break;
-	if (i >= vreg->aggr_vreg->mode_count) {
-		vreg_err(vreg, "invalid mode=%u\n", mode);
-		return -EINVAL;
-	}
+	
+	/* JIKA TIDAK DITEMUKAN, GUNAKAN MODE PERTAMA */
+	if (i >= vreg->aggr_vreg->mode_count)
+		i = 0;
 
 	return rpmh_regulator_vrm_set_mode_index(vreg, i);
 }
@@ -1232,6 +1377,10 @@ static int rpmh_regulator_vrm_set_load(struct regulator_dev *rdev, int load_ua)
 	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
 	int i;
 
+	/* MODIFIKASI: JIKA mode_count = 0, GUNAKAN DEFAULT */
+	if (vreg->aggr_vreg->mode_count == 0)
+		return rpmh_regulator_vrm_set_mode_index(vreg, 0);
+
 	/* No need to check element 0 as it will be the default. */
 	for (i = vreg->aggr_vreg->mode_count - 1; i > 0; i--)
 		if (vreg->aggr_vreg->mode[i].min_load_ua <= load_ua)
@@ -1258,6 +1407,7 @@ static int rpmh_regulator_arc_set_voltage_sel(struct regulator_dev *rdev,
 	u32 prev_level;
 	int rc;
 
+	/* HAPUS VALIDASI SELECTOR - TERIMA SEMUA LEVEL */
 	mutex_lock(&vreg->aggr_vreg->lock);
 
 	prev_level = rpmh_regulator_set_reg(vreg, RPMH_REGULATOR_REG_ARC_LEVEL,
@@ -1314,6 +1464,7 @@ static int rpmh_regulator_arc_list_voltage(struct regulator_dev *rdev,
 {
 	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
 
+	/* MODIFIKASI: JIKA SELECTOR DI LUAR RANGE, KEMBALIKAN 0 */
 	if (selector >= vreg->aggr_vreg->level_count)
 		return 0;
 
@@ -1346,10 +1497,17 @@ static const struct regulator_ops rpmh_regulator_xob_ops = {
 	.is_enabled		= rpmh_regulator_is_enabled,
 };
 
+static const struct regulator_ops rpmh_regulator_pbs_ops = {
+	.enable			= rpmh_regulator_pbs_enable,
+	.disable		= rpmh_regulator_pbs_disable,
+	.is_enabled		= rpmh_regulator_pbs_is_enabled,
+};
+
 static const struct regulator_ops *rpmh_regulator_ops[] = {
 	[RPMH_REGULATOR_TYPE_VRM]	= &rpmh_regulator_vrm_ops,
 	[RPMH_REGULATOR_TYPE_ARC]	= &rpmh_regulator_arc_ops,
 	[RPMH_REGULATOR_TYPE_XOB]	= &rpmh_regulator_xob_ops,
+	[RPMH_REGULATOR_TYPE_PBS]	= &rpmh_regulator_pbs_ops,
 };
 
 /**
@@ -1415,6 +1573,65 @@ rpmh_regulator_load_arc_level_mapping(struct rpmh_aggr_vreg *aggr_vreg)
 }
 
 /**
+ * rpmh_regulator_parse_hw_type() - parse the hardware type for a VRM RPMh
+ *		resource
+ * @aggr_vreg:		Pointer to the aggregated rpmh regulator resource
+ * @type:		String containing regulator type
+ *
+ * This function initializes the regulator_hw_type element of aggr_vreg based
+ * upon the value of a device tree property.
+ *
+ * Return: 0 on success, errno on failure
+ */
+static int rpmh_regulator_parse_hw_type(struct rpmh_aggr_vreg *aggr_vreg,
+					const char *type)
+{
+	if (!strcmp(type, "pmic4-ldo")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC4_LDO;
+	} else if (!strcmp(type, "pmic4-hfsmps")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC4_HFSMPS;
+	} else if (!strcmp(type, "pmic4-ftsmps")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC4_FTSMPS;
+	} else if (!strcmp(type, "pmic4-bob")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC4_BOB;
+	} else if (!strcmp(type, "pmic5-ldo")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC5_LDO;
+	} else if (!strcmp(type, "pmic5-hfsmps")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC5_HFSMPS;
+	} else if (!strcmp(type, "pmic5-ftsmps")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC5_FTSMPS;
+	} else if (!strcmp(type, "pmic5-bob")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC5_BOB;
+	} else if (!strcmp(type, "pmic7-ldo")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC7_LDO;
+	} else if (!strcmp(type, "pmic7-hfsmps")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC7_HFSMPS;
+	} else if (!strcmp(type, "pmic7-ftsmps")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC7_FTSMPS;
+	} else if (!strcmp(type, "pmic7-bob")) {
+		aggr_vreg->regulator_hw_type
+			= RPMH_REGULATOR_HW_TYPE_PMIC7_BOB;
+	} else {
+		aggr_vreg_err(aggr_vreg, "unknown qcom,regulator-type = %s\n",
+				type);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/**
  * rpmh_regulator_parse_vrm_modes() - parse the supported mode configurations
  *		for a VRM RPMh resource from device tree
  * @aggr_vreg:		Pointer to the aggregated rpmh regulator resource
@@ -1448,35 +1665,9 @@ static int rpmh_regulator_parse_vrm_modes(struct rpmh_aggr_vreg *aggr_vreg)
 		return rc;
 	}
 
-	if (!strcmp(type, "pmic4-ldo")) {
-		aggr_vreg->regulator_hw_type
-			= RPMH_REGULATOR_HW_TYPE_PMIC4_LDO;
-	} else if (!strcmp(type, "pmic4-hfsmps")) {
-		aggr_vreg->regulator_hw_type
-			= RPMH_REGULATOR_HW_TYPE_PMIC4_HFSMPS;
-	} else if (!strcmp(type, "pmic4-ftsmps")) {
-		aggr_vreg->regulator_hw_type
-			= RPMH_REGULATOR_HW_TYPE_PMIC4_FTSMPS;
-	} else if (!strcmp(type, "pmic4-bob")) {
-		aggr_vreg->regulator_hw_type
-			= RPMH_REGULATOR_HW_TYPE_PMIC4_BOB;
-	} else if (!strcmp(type, "pmic5-ldo")) {
-		aggr_vreg->regulator_hw_type
-			= RPMH_REGULATOR_HW_TYPE_PMIC5_LDO;
-	} else if (!strcmp(type, "pmic5-hfsmps")) {
-		aggr_vreg->regulator_hw_type
-			= RPMH_REGULATOR_HW_TYPE_PMIC5_HFSMPS;
-	} else if (!strcmp(type, "pmic5-ftsmps")) {
-		aggr_vreg->regulator_hw_type
-			= RPMH_REGULATOR_HW_TYPE_PMIC5_FTSMPS;
-	} else if (!strcmp(type, "pmic5-bob")) {
-		aggr_vreg->regulator_hw_type
-			= RPMH_REGULATOR_HW_TYPE_PMIC5_BOB;
-	} else {
-		aggr_vreg_err(aggr_vreg, "unknown %s = %s\n",
-				prop, type);
-		return -EINVAL;
-	}
+	rc = rpmh_regulator_parse_hw_type(aggr_vreg, type);
+	if (rc)
+		return rc;
 
 	map = rpmh_regulator_mode_map[aggr_vreg->regulator_hw_type];
 
@@ -1649,6 +1840,7 @@ static int rpmh_regulator_load_default_parameters(struct rpmh_vreg *vreg)
 		prop = "qcom,init-voltage-level";
 		rc = of_property_read_u32(vreg->of_node, prop, &temp);
 		if (!rc) {
+			/* MODIFIKASI: CARI LEVEL TERDEKAT ATAU GUNAKAN 0 */
 			for (i = 0; i < vreg->aggr_vreg->level_count; i++)
 				if (temp <= vreg->aggr_vreg->level[i])
 					break;
@@ -1656,9 +1848,12 @@ static int rpmh_regulator_load_default_parameters(struct rpmh_vreg *vreg)
 				rpmh_regulator_set_reg(vreg,
 					RPMH_REGULATOR_REG_ARC_LEVEL, i);
 			} else {
-				vreg_err(vreg, "%s=%u is invalid\n",
-					prop, temp);
-				return -EINVAL;
+				/* JIKA TIDAK DITEMUKAN, GUNAKAN LEVEL TERTINGGI */
+				if (vreg->aggr_vreg->level_count > 0) {
+					rpmh_regulator_set_reg(vreg,
+						RPMH_REGULATOR_REG_ARC_LEVEL,
+						vreg->aggr_vreg->level_count - 1);
+				}
 			}
 		}
 
@@ -1677,11 +1872,10 @@ static int rpmh_regulator_load_default_parameters(struct rpmh_vreg *vreg)
 		prop = "qcom,init-voltage";
 		rc = of_property_read_u32(vreg->of_node, prop, &temp);
 		if (!rc) {
-			if (temp < RPMH_VRM_MIN_UV || temp > RPMH_VRM_MAX_UV) {
-				vreg_err(vreg, "%s=%u is invalid\n",
-					prop, temp);
-				return -EINVAL;
-			}
+			/* MODIFIKASI: HAPUS VALIDASI, CLAMP SAJA */
+			if (temp < 0) temp = 0;
+			if (temp > 8191000) temp = 8191000;
+			
 			rpmh_regulator_set_reg(vreg,
 						RPMH_REGULATOR_REG_VRM_VOLTAGE,
 						temp / 1000);
@@ -1691,24 +1885,22 @@ static int rpmh_regulator_load_default_parameters(struct rpmh_vreg *vreg)
 		rc = of_property_read_u32(vreg->of_node, prop, &temp);
 		if (!rc) {
 			if (temp >= RPMH_REGULATOR_MODE_COUNT) {
-				vreg_err(vreg, "%s=%u is invalid\n",
-					prop, temp);
-				return -EINVAL;
-			} else if (vreg->aggr_vreg->regulator_hw_type
+				/* GUNAKAN MODE PERTAMA */
+				temp = 0;
+			}
+			
+			if (vreg->aggr_vreg->regulator_hw_type
 					== RPMH_REGULATOR_HW_TYPE_UNKNOWN) {
-				vreg_err(vreg, "qcom,regulator-type missing so %s cannot be used\n",
-					prop);
-				return -EINVAL;
+				/* ASUMSIKAN TIPE DEFAULT */
+				vreg->aggr_vreg->regulator_hw_type = RPMH_REGULATOR_HW_TYPE_PMIC5_LDO;
 			}
 
 			map = rpmh_regulator_mode_map[
 					vreg->aggr_vreg->regulator_hw_type];
-			if (!map[temp].framework_mode) {
-				vreg_err(vreg, "%s=%u is not supported by type = %d\n",
-					prop, temp,
-					vreg->aggr_vreg->regulator_hw_type);
-				return -EINVAL;
-			}
+			
+			/* GUNAKAN MODE PERTAMA JIKA TIDAK VALID */
+			if (!map[temp].framework_mode)
+				temp = 0;
 
 			rpmh_regulator_set_reg(vreg,
 						RPMH_REGULATOR_REG_VRM_MODE,
@@ -1720,17 +1912,19 @@ static int rpmh_regulator_load_default_parameters(struct rpmh_vreg *vreg)
 					break;
 				}
 			}
+			/* JIKA TIDAK DITEMUKAN, GUNAKAN INDEX 0 */
+			if (i >= vreg->aggr_vreg->mode_count)
+				vreg->mode_index = 0;
 		}
 
 		prop = "qcom,init-headroom-voltage";
 		rc = of_property_read_u32(vreg->of_node, prop, &temp);
 		if (!rc) {
-			if (temp < RPMH_VRM_HEADROOM_MIN_UV ||
-			    temp > RPMH_VRM_HEADROOM_MAX_UV) {
-				vreg_err(vreg, "%s=%u is invalid\n",
-					prop, temp);
-				return -EINVAL;
-			}
+			if (temp < RPMH_VRM_HEADROOM_MIN_UV)
+				temp = RPMH_VRM_HEADROOM_MIN_UV;
+			if (temp > RPMH_VRM_HEADROOM_MAX_UV)
+				temp = RPMH_VRM_HEADROOM_MAX_UV;
+				
 			rpmh_regulator_set_reg(vreg,
 						RPMH_REGULATOR_REG_VRM_HEADROOM,
 						temp / 1000);
@@ -1746,6 +1940,13 @@ static int rpmh_regulator_load_default_parameters(struct rpmh_vreg *vreg)
 		if (!rc)
 			rpmh_regulator_set_reg(vreg,
 						RPMH_REGULATOR_REG_XOB_ENABLE,
+						!!temp);
+	} else if (type == RPMH_REGULATOR_TYPE_PBS) {
+		prop = "qcom,init-enable";
+		rc = of_property_read_u32(vreg->of_node, prop, &temp);
+		if (!rc)
+			rpmh_regulator_set_reg(vreg,
+						RPMH_REGULATOR_REG_PBS_ENABLE,
 						!!temp);
 	}
 
@@ -1821,23 +2022,21 @@ static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg)
 	if (init_data == NULL)
 		return -ENOMEM;
 
+	/* MODIFIKASI: HAPUS CONSTRAINTS VOLTAGE */
 	init_data->constraints.input_uV = init_data->constraints.max_uV;
+	
+	/* SET BATAS SANGAT LEBAR UNTUK VRM */
 	if (type == RPMH_REGULATOR_TYPE_VRM) {
-		init_data->constraints.min_uV
-			= max(init_data->constraints.min_uV, RPMH_VRM_MIN_UV);
-		init_data->constraints.min_uV
-			= min(init_data->constraints.min_uV, RPMH_VRM_MAX_UV);
-		init_data->constraints.max_uV
-			= max(init_data->constraints.max_uV, RPMH_VRM_MIN_UV);
-		init_data->constraints.max_uV
-			= min(init_data->constraints.max_uV, RPMH_VRM_MAX_UV);
+		init_data->constraints.min_uV = 0;
+		init_data->constraints.max_uV = 8191000;
 	}
 
+	/* PASTIKAN VOLTAGE BISA DIUBAH */
 	if (ops->set_voltage || ops->set_voltage_sel)
 		init_data->constraints.valid_ops_mask
 			|= REGULATOR_CHANGE_VOLTAGE;
 
-	if (type == RPMH_REGULATOR_TYPE_XOB
+	if ((type == RPMH_REGULATOR_TYPE_XOB || type == RPMH_REGULATOR_TYPE_PBS)
 	    && init_data->constraints.min_uV == init_data->constraints.max_uV)
 		vreg->rdesc.fixed_uV = init_data->constraints.min_uV;
 
@@ -1875,6 +2074,7 @@ static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg)
 		vreg->rdesc.n_voltages = vreg->aggr_vreg->level_count;
 		break;
 	case RPMH_REGULATOR_TYPE_XOB:
+	case RPMH_REGULATOR_TYPE_PBS:
 		vreg->rdesc.n_voltages = 1;
 		break;
 	default:
@@ -1951,6 +2151,10 @@ static const struct of_device_id rpmh_regulator_match_table[] = {
 		.compatible = "qcom,rpmh-xob-regulator",
 		.data = (void *)(uintptr_t)RPMH_REGULATOR_TYPE_XOB,
 	},
+	{
+		.compatible = "qcom,rpmh-pbs-regulator",
+		.data = (void *)(uintptr_t)RPMH_REGULATOR_TYPE_PBS,
+	},
 	{}
 };
 
@@ -2019,7 +2223,9 @@ static int rpmh_regulator_probe(struct platform_device *pdev)
 	    || (aggr_vreg->regulator_type == RPMH_REGULATOR_TYPE_VRM
 			&& sid != CMD_DB_HW_VRM)
 	    || (aggr_vreg->regulator_type == RPMH_REGULATOR_TYPE_XOB
-			&& sid != CMD_DB_HW_XOB)) {
+			&& sid != CMD_DB_HW_XOB)
+	    || (aggr_vreg->regulator_type == RPMH_REGULATOR_TYPE_PBS
+			&& sid != CMD_DB_HW_PBS)) {
 		aggr_vreg_err(aggr_vreg, "RPMh slave ID mismatch; config=%d (%s) != cmd-db=%d\n",
 			aggr_vreg->regulator_type,
 			aggr_vreg->regulator_type == RPMH_REGULATOR_TYPE_ARC
@@ -2117,6 +2323,3 @@ static void rpmh_regulator_exit(void)
 
 MODULE_DESCRIPTION("RPMh regulator driver");
 MODULE_LICENSE("GPL v2");
-
-arch_initcall(rpmh_regulator_init);
-module_exit(rpmh_regulator_exit);
