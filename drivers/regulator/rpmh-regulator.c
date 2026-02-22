@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2016-2021, The Linux Foundation. All rights reserved. */
 /* Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved. */
@@ -25,6 +24,22 @@
 #include <soc/qcom/rpmh.h>
 
 #include <dt-bindings/regulator/qcom,rpmh-regulator-levels.h>
+
+static ssize_t uv_override_show(struct device *dev,
+				struct device_attribute *attr,
+				char *buf);
+static ssize_t uv_override_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count);
+
+static struct device_attribute dev_attr_uv_override = {
+	.attr = {
+		.name = "uv_override",
+		.mode = 0666,   /* ← 超重要 */
+	},
+	.show  = uv_override_show,
+	.store = uv_override_store,
+};
 
 /**
  * enum rpmh_regulator_type - supported RPMh accelerator types
@@ -1017,13 +1032,9 @@ static u32 rpmh_regulator_set_reg(struct rpmh_vreg *vreg, int reg_index,
 static void rpmh_regulator_check_param_max(struct rpmh_aggr_vreg *aggr_vreg,
 					int index, u32 new_max)
 {
-	/* HAPUS - TIDAK PERLU VALIDASI LAGI */
-	// if ((aggr_vreg->aggr_req_active.valid & BIT(index))
-	//     && aggr_vreg->aggr_req_active.reg[index] > new_max)
-	//	aggr_vreg->next_wait_for_ack = true;
-	
-	/* SELALU WAIT FOR ACK UNTUK KEAMANAN (opsional) */
-	aggr_vreg->next_wait_for_ack = true;
+	if ((aggr_vreg->aggr_req_active.valid & BIT(index))
+	    && aggr_vreg->aggr_req_active.reg[index] > new_max)
+		aggr_vreg->next_wait_for_ack = true;
 }
 
 /**
@@ -1127,6 +1138,15 @@ static int rpmh_regulator_pbs_enable(struct regulator_dev *rdev)
 	return rc;
 }
 
+static void rpmh_add_uv_override_sysfs(struct rpmh_vreg *vreg)
+{
+	int rc;
+
+	rc = device_create_file(&vreg->rdev->dev, &dev_attr_uv_override);
+	if (rc)
+		vreg_err(vreg, "failed to create uv_override sysfs\n");
+}
+
 /**
  * rpmh_regulator_disable() - disable the RPMh regulator
  * @rdev:		Regulator device pointer for the rpmh-regulator
@@ -1206,27 +1226,17 @@ static int rpmh_regulator_vrm_set_voltage(struct regulator_dev *rdev,
 	int mv;
 	int rc = 0;
 
-	/* HAPUS VALIDASI INI - USER BEBAS MENGATUR */
-	// mv = DIV_ROUND_UP(min_uv, 1000);
-	// if (mv * 1000 > max_uv) {
-	//	vreg_err(vreg, "no set points available in range %d-%d uV\n",
-	//		min_uv, max_uv);
-	//	return -EINVAL;
-	// }
-
-	/* LANGSUNG PAKAI min_uv, HANYA CLAMP KE BATAS HARDWARE */
 	mv = DIV_ROUND_UP(min_uv, 1000);
-	
-	/* Clamp ke batas hardware PMIC untuk keamanan minimal */
-	if (mv < 0) mv = 0;
-	if (mv > 8191) mv = 8191; /* RPMH_VRM_MAX_UV/1000 = 8191 */
+	if (mv * 1000 > max_uv) {
+		vreg_err(vreg, "no set points available in range %d-%d uV\n",
+			min_uv, max_uv);
+		return -EINVAL;
+	}
 
 	mutex_lock(&vreg->aggr_vreg->lock);
 
 	prev_voltage
 	     = rpmh_regulator_set_reg(vreg, RPMH_REGULATOR_REG_VRM_VOLTAGE, mv);
-	
-	/* HAPUS ATAU MODIFIKASI check_param_max */
 	rpmh_regulator_check_param_max(vreg->aggr_vreg,
 				RPMH_REGULATOR_REG_VRM_VOLTAGE, max_uv);
 
@@ -1277,10 +1287,6 @@ static int rpmh_regulator_vrm_set_mode_index(struct rpmh_vreg *vreg,
 	u32 prev_mode;
 	int rc;
 
-	/* HAPUS VALIDASI mode_index */
-	// if (mode_index >= vreg->aggr_vreg->mode_count)
-	//    mode_index = 0;
-
 	mutex_lock(&vreg->aggr_vreg->lock);
 
 	prev_mode = rpmh_regulator_set_reg(vreg, RPMH_REGULATOR_REG_VRM_MODE,
@@ -1324,14 +1330,13 @@ static int rpmh_regulator_vrm_set_mode(struct regulator_dev *rdev,
 	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
 	int i;
 
-	/* HAPUS VALIDASI - TERIMA SEMUA MODE */
 	for (i = 0; i < vreg->aggr_vreg->mode_count; i++)
 		if (vreg->aggr_vreg->mode[i].framework_mode == mode)
 			break;
-	
-	/* JIKA TIDAK DITEMUKAN, GUNAKAN MODE PERTAMA */
-	if (i >= vreg->aggr_vreg->mode_count)
-		i = 0;
+	if (i >= vreg->aggr_vreg->mode_count) {
+		vreg_err(vreg, "invalid mode=%u\n", mode);
+		return -EINVAL;
+	}
 
 	return rpmh_regulator_vrm_set_mode_index(vreg, i);
 }
@@ -1377,10 +1382,6 @@ static int rpmh_regulator_vrm_set_load(struct regulator_dev *rdev, int load_ua)
 	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
 	int i;
 
-	/* MODIFIKASI: JIKA mode_count = 0, GUNAKAN DEFAULT */
-	if (vreg->aggr_vreg->mode_count == 0)
-		return rpmh_regulator_vrm_set_mode_index(vreg, 0);
-
 	/* No need to check element 0 as it will be the default. */
 	for (i = vreg->aggr_vreg->mode_count - 1; i > 0; i--)
 		if (vreg->aggr_vreg->mode[i].min_load_ua <= load_ua)
@@ -1407,7 +1408,6 @@ static int rpmh_regulator_arc_set_voltage_sel(struct regulator_dev *rdev,
 	u32 prev_level;
 	int rc;
 
-	/* HAPUS VALIDASI SELECTOR - TERIMA SEMUA LEVEL */
 	mutex_lock(&vreg->aggr_vreg->lock);
 
 	prev_level = rpmh_regulator_set_reg(vreg, RPMH_REGULATOR_REG_ARC_LEVEL,
@@ -1464,7 +1464,6 @@ static int rpmh_regulator_arc_list_voltage(struct regulator_dev *rdev,
 {
 	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
 
-	/* MODIFIKASI: JIKA SELECTOR DI LUAR RANGE, KEMBALIKAN 0 */
 	if (selector >= vreg->aggr_vreg->level_count)
 		return 0;
 
@@ -1840,7 +1839,6 @@ static int rpmh_regulator_load_default_parameters(struct rpmh_vreg *vreg)
 		prop = "qcom,init-voltage-level";
 		rc = of_property_read_u32(vreg->of_node, prop, &temp);
 		if (!rc) {
-			/* MODIFIKASI: CARI LEVEL TERDEKAT ATAU GUNAKAN 0 */
 			for (i = 0; i < vreg->aggr_vreg->level_count; i++)
 				if (temp <= vreg->aggr_vreg->level[i])
 					break;
@@ -1848,12 +1846,9 @@ static int rpmh_regulator_load_default_parameters(struct rpmh_vreg *vreg)
 				rpmh_regulator_set_reg(vreg,
 					RPMH_REGULATOR_REG_ARC_LEVEL, i);
 			} else {
-				/* JIKA TIDAK DITEMUKAN, GUNAKAN LEVEL TERTINGGI */
-				if (vreg->aggr_vreg->level_count > 0) {
-					rpmh_regulator_set_reg(vreg,
-						RPMH_REGULATOR_REG_ARC_LEVEL,
-						vreg->aggr_vreg->level_count - 1);
-				}
+				vreg_err(vreg, "%s=%u is invalid\n",
+					prop, temp);
+				return -EINVAL;
 			}
 		}
 
@@ -1872,10 +1867,11 @@ static int rpmh_regulator_load_default_parameters(struct rpmh_vreg *vreg)
 		prop = "qcom,init-voltage";
 		rc = of_property_read_u32(vreg->of_node, prop, &temp);
 		if (!rc) {
-			/* MODIFIKASI: HAPUS VALIDASI, CLAMP SAJA */
-			if (temp < 0) temp = 0;
-			if (temp > 8191000) temp = 8191000;
-			
+			if (temp < RPMH_VRM_MIN_UV || temp > RPMH_VRM_MAX_UV) {
+				vreg_err(vreg, "%s=%u is invalid\n",
+					prop, temp);
+				return -EINVAL;
+			}
 			rpmh_regulator_set_reg(vreg,
 						RPMH_REGULATOR_REG_VRM_VOLTAGE,
 						temp / 1000);
@@ -1885,22 +1881,24 @@ static int rpmh_regulator_load_default_parameters(struct rpmh_vreg *vreg)
 		rc = of_property_read_u32(vreg->of_node, prop, &temp);
 		if (!rc) {
 			if (temp >= RPMH_REGULATOR_MODE_COUNT) {
-				/* GUNAKAN MODE PERTAMA */
-				temp = 0;
-			}
-			
-			if (vreg->aggr_vreg->regulator_hw_type
+				vreg_err(vreg, "%s=%u is invalid\n",
+					prop, temp);
+				return -EINVAL;
+			} else if (vreg->aggr_vreg->regulator_hw_type
 					== RPMH_REGULATOR_HW_TYPE_UNKNOWN) {
-				/* ASUMSIKAN TIPE DEFAULT */
-				vreg->aggr_vreg->regulator_hw_type = RPMH_REGULATOR_HW_TYPE_PMIC5_LDO;
+				vreg_err(vreg, "qcom,regulator-type missing so %s cannot be used\n",
+					prop);
+				return -EINVAL;
 			}
 
 			map = rpmh_regulator_mode_map[
 					vreg->aggr_vreg->regulator_hw_type];
-			
-			/* GUNAKAN MODE PERTAMA JIKA TIDAK VALID */
-			if (!map[temp].framework_mode)
-				temp = 0;
+			if (!map[temp].framework_mode) {
+				vreg_err(vreg, "%s=%u is not supported by type = %d\n",
+					prop, temp,
+					vreg->aggr_vreg->regulator_hw_type);
+				return -EINVAL;
+			}
 
 			rpmh_regulator_set_reg(vreg,
 						RPMH_REGULATOR_REG_VRM_MODE,
@@ -1912,19 +1910,17 @@ static int rpmh_regulator_load_default_parameters(struct rpmh_vreg *vreg)
 					break;
 				}
 			}
-			/* JIKA TIDAK DITEMUKAN, GUNAKAN INDEX 0 */
-			if (i >= vreg->aggr_vreg->mode_count)
-				vreg->mode_index = 0;
 		}
 
 		prop = "qcom,init-headroom-voltage";
 		rc = of_property_read_u32(vreg->of_node, prop, &temp);
 		if (!rc) {
-			if (temp < RPMH_VRM_HEADROOM_MIN_UV)
-				temp = RPMH_VRM_HEADROOM_MIN_UV;
-			if (temp > RPMH_VRM_HEADROOM_MAX_UV)
-				temp = RPMH_VRM_HEADROOM_MAX_UV;
-				
+			if (temp < RPMH_VRM_HEADROOM_MIN_UV ||
+			    temp > RPMH_VRM_HEADROOM_MAX_UV) {
+				vreg_err(vreg, "%s=%u is invalid\n",
+					prop, temp);
+				return -EINVAL;
+			}
 			rpmh_regulator_set_reg(vreg,
 						RPMH_REGULATOR_REG_VRM_HEADROOM,
 						temp / 1000);
@@ -1992,6 +1988,8 @@ static int rpmh_regulator_init_vreg_supply(struct rpmh_vreg *vreg)
 	return 0;
 }
 
+static void rpmh_add_uv_override_sysfs(struct rpmh_vreg *vreg);
+
 /**
  * rpmh_regulator_init_vreg() - initialize all abbributes of an rpmh-regulator
  * @vreg:		Pointer to the RPMh regulator
@@ -2022,16 +2020,18 @@ static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg)
 	if (init_data == NULL)
 		return -ENOMEM;
 
-	/* MODIFIKASI: HAPUS CONSTRAINTS VOLTAGE */
 	init_data->constraints.input_uV = init_data->constraints.max_uV;
-	
-	/* SET BATAS SANGAT LEBAR UNTUK VRM */
 	if (type == RPMH_REGULATOR_TYPE_VRM) {
-		init_data->constraints.min_uV = 0;
-		init_data->constraints.max_uV = 8191000;
+		init_data->constraints.min_uV
+			= max(init_data->constraints.min_uV, RPMH_VRM_MIN_UV);
+		init_data->constraints.min_uV
+			= min(init_data->constraints.min_uV, RPMH_VRM_MAX_UV);
+		init_data->constraints.max_uV
+			= max(init_data->constraints.max_uV, RPMH_VRM_MIN_UV);
+		init_data->constraints.max_uV
+			= min(init_data->constraints.max_uV, RPMH_VRM_MAX_UV);
 	}
 
-	/* PASTIKAN VOLTAGE BISA DIUBAH */
 	if (ops->set_voltage || ops->set_voltage_sel)
 		init_data->constraints.valid_ops_mask
 			|= REGULATOR_CHANGE_VOLTAGE;
@@ -2119,6 +2119,8 @@ static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg)
 		vreg_err(vreg, "devm_regulator_register() failed, rc=%d\n", rc);
 		return rc;
 	}
+	
+	rpmh_add_uv_override_sysfs(vreg);
 
 	rc = devm_regulator_proxy_consumer_register(dev, vreg->of_node);
 	if (rc)
@@ -2299,6 +2301,45 @@ static int rpmh_regulator_probe(struct platform_device *pdev)
 	return rc;
 }
 
+static ssize_t uv_override_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct regulator_dev *rdev =
+		container_of(dev, struct regulator_dev, dev);
+	int uv;
+	int rc;
+
+	if (kstrtoint(buf, 10, &uv))
+		return -EINVAL;
+
+	/*
+	 * regulator framework を通さず、
+	 * VRM に直接投げる（min/max 無視）
+	 */
+	rc = rpmh_regulator_vrm_set_voltage(rdev, uv, uv, NULL);
+	if (rc) {
+		dev_err(dev, "uv_override set failed: %d\n", rc);
+		return rc;
+	}
+
+	return count;
+}
+
+
+static ssize_t uv_override_show(struct device *dev,
+				struct device_attribute *attr,
+				char *buf)
+{
+	struct regulator_dev *rdev =
+		container_of(dev, struct regulator_dev, dev);
+	int uv;
+
+	uv = rpmh_regulator_vrm_get_voltage(rdev);
+	return scnprintf(buf, PAGE_SIZE, "%d\n", uv);
+}
+
+
 static struct platform_driver rpmh_regulator_driver = {
 	.driver = {
 		.name		= "qcom,rpmh-regulator",
@@ -2323,3 +2364,6 @@ static void rpmh_regulator_exit(void)
 
 MODULE_DESCRIPTION("RPMh regulator driver");
 MODULE_LICENSE("GPL v2");
+
+arch_initcall(rpmh_regulator_init);
+module_exit(rpmh_regulator_exit);
