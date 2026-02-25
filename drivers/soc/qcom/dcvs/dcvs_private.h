@@ -39,6 +39,8 @@ struct dcvs_hw {
 	u32			hw_min_freq;
 	u32			hw_max_freq;
 	u32			boost_freq;
+	u32			voltage_limit;
+	bool			voltage_override;
 	struct dcvs_path	*dcvs_paths[NUM_DCVS_PATHS];
 	u32			num_paths;
 	u32			num_inited_paths;
