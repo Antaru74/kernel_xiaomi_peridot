@@ -331,9 +331,47 @@ static int qcom_cpufreq_hw_read_lut(struct device *cpu_dev,
 		if (i == 0)
 			max_cc = core_count;
 
-		data = readl_relaxed(drv_data->base + soc_data->reg_volt_lut +
-				      i * soc_data->lut_row_size);
+		u32 data_cur, data_adj;
+		u32 volt_cur, volt_adj;
+		u32 volt_idx = i;
+
+/* 現在の電圧を取得 */
+		data_cur = readl_relaxed(drv_data->base +
+					 soc_data->reg_volt_lut +
+					 i * soc_data->lut_row_size);
+		volt_cur = FIELD_GET(LUT_VOLT, data_cur);
+
+/* 1段目チェック */
+		if (i > 0) {
+			data_adj = readl_relaxed(drv_data->base +
+						 soc_data->reg_volt_lut +
+						 (i - 1) * soc_data->lut_row_size);
+			volt_adj = FIELD_GET(LUT_VOLT, data_adj);
+
+			if (volt_adj < volt_cur) {
+				volt_idx = i - 1;
+				volt_cur = volt_adj;
+
+		/* 2段目チェック */
+				if (i > 1) {
+					data_adj = readl_relaxed(drv_data->base +
+								 soc_data->reg_volt_lut +
+								 (i - 2) * soc_data->lut_row_size);
+					volt_adj = FIELD_GET(LUT_VOLT, data_adj);
+
+					if (volt_adj < volt_cur)
+						volt_idx = i - 2;
+				}
+			}
+		}
+
+/* 最終決定 */
+		data = readl_relaxed(drv_data->base +
+				     soc_data->reg_volt_lut +
+				     volt_idx * soc_data->lut_row_size);
 		volt = FIELD_GET(LUT_VOLT, data) * 1000;
+
+
 
 		if (src)
 			freq = xo_rate * lval / 1000;
