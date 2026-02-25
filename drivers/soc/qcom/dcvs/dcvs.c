@@ -196,6 +196,47 @@ static ssize_t show_available_frequencies(struct kobject *kobj,
 	return cnt;
 }
 
+/*
+ * voltage_limit sysfs attribute (RW, 0644)
+ * Allows user to override all votes and limit frequency.
+ * Write 0 to disable override.
+ */
+static ssize_t show_voltage_limit(struct kobject *kobj,
+				struct attribute *attr, char *buf)
+{
+	struct dcvs_hw *hw = to_dcvs_hw(kobj);
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n",
+			hw->voltage_override ? hw->voltage_limit : 0);
+}
+
+static ssize_t store_voltage_limit(struct kobject *kobj,
+				struct attribute *attr, const char *buf,
+				size_t count)
+{
+	int ret;
+	unsigned int val;
+	struct dcvs_hw *hw = to_dcvs_hw(kobj);
+
+	ret = kstrtouint(buf, 10, &val);
+	if (ret < 0)
+		return ret;
+
+	/* 0 = disable override */
+	if (val == 0) {
+		hw->voltage_override = false;
+		hw->voltage_limit = 0;
+		return count;
+	}
+
+	val = clamp(val, hw->hw_min_freq, hw->hw_max_freq);
+
+	hw->voltage_limit = val;
+	hw->voltage_override = true;
+
+	return count;
+}
+
 show_attr(hw_min_freq);
 show_attr(hw_max_freq);
 show_attr(boost_freq);
@@ -205,6 +246,8 @@ DCVS_ATTR_RO(hw_max_freq);
 DCVS_ATTR_RW(boost_freq);
 DCVS_ATTR_RO(cur_freq);
 DCVS_ATTR_RO(available_frequencies);
+static struct qcom_dcvs_attr voltage_limit =
+__ATTR(voltage_limit, 0644, show_voltage_limit, store_voltage_limit);
 
 static struct attribute *dcvs_hw_attrs[] = {
 	&hw_min_freq.attr,
@@ -212,6 +255,7 @@ static struct attribute *dcvs_hw_attrs[] = {
 	&boost_freq.attr,
 	&cur_freq.attr,
 	&available_frequencies.attr,
+	&voltage_limit.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(dcvs_hw);
@@ -274,6 +318,9 @@ static u32 get_target_freq(struct dcvs_path *path, u32 freq)
 
 	if (path->type == DCVS_SLOW_PATH)
 		freq = max(freq, hw->boost_freq);
+
+	if (hw->voltage_override)
+		freq = min(freq, hw->voltage_limit);
 
 	for (i = 0; i < len; i++) {
 		if (freq <= freq_table[i]) {
